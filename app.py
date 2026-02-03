@@ -341,6 +341,7 @@ with tab_briefing:
                 st.success("전송됨")
 
 # --- [Tab 2: 블로그 (참고문헌 자동 추가 기능)] ---
+# --- [Tab 2: 블로그 (상위 개념 확장 검색 기능 탑재)] ---
 with tab_blog:
     c_b1, c_b2 = st.columns([1, 3])
     with c_b1:
@@ -360,10 +361,10 @@ with tab_blog:
             if st.button("🚀 심층 분석 & 글쓰기"):
                 if not openai_api_key: st.error("Key 없음")
                 else:
-                    with st.spinner("1. 자료 분석 중..."):
+                    # 1. 본문 텍스트 확보
+                    with st.spinner("1. 자료 분석 중... (PDF/PMC)"):
                         status_msg = "초록(Abstract) 기반"
                         content_source = target_paper['abstract']
-                        
                         if uploaded_pdf:
                             pdf_txt = read_pdf_file(uploaded_pdf)
                             if pdf_txt: content_source = pdf_txt; status_msg = "📂 PDF 전문 분석"
@@ -371,52 +372,75 @@ with tab_blog:
                             pmc_txt, pmc_msg = fetch_pmc_fulltext(target_paper['pmid'])
                             if pmc_txt: content_source = pmc_txt; status_msg = pmc_msg
 
-                    with st.spinner("2. Consensus 교차 검증 중..."):
+                    # 2. [핵심 변경] 검색어 2개 생성 (Specific / Broad)
+                    with st.spinner("2. 확장형 교차 검증(Consensus) 실행 중..."):
                         client = OpenAI(api_key=openai_api_key)
                         
-                        # [수정] AI에게 검색어와 함께 '검증 키워드'도 달라고 요청 (JSON 포맷)
+                        # AI에게 "좁은 검색어"와 "넓은 검색어"를 동시에 요청
                         q_prompt = f"""
-                        Analyze this text and generate two things for PubMed search:
-                        1. A specific search query (English) to verify efficacy.
-                        2. A list of 2-3 essential keywords (English) that MUST appear in the reference titles (e.g., disease name, intervention).
+                        Analyze this text and generate TWO English search queries for PubMed validation.
                         
-                        Text: {content_source[:2000]}
+                        1. "Specific": Exact intervention + Exact disease (e.g., "Sopoongsan AND Atopic Dermatitis")
+                        2. "Broad": Intervention class + Symptom/Disease category (e.g., "Herbal Medicine AND Pruritus", "TCM AND Eczema")
+                        
+                        * Only output valid JSON.
+                        
+                        Text: {content_source[:1500]}
                         
                         Output JSON format:
                         {{
-                            "query": "(Intervention) AND (Disease)",
-                            "keywords": ["keyword1", "keyword2"]
+                            "specific": "Query string 1",
+                            "broad": "Query string 2"
                         }}
                         """
                         try:
-                            q_resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":q_prompt}], temperature=0.0).choices[0].message.content
+                            q_resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":q_prompt}]).choices[0].message.content
                             q_json = json.loads(re.search(r'\{.*\}', q_resp, re.DOTALL).group())
                             
-                            query = q_json['query']
-                            keywords = q_json['keywords']
+                            q_specific = q_json['specific']
+                            q_broad = q_json['broad']
                             
-                            # [수정] 함수 호출 시 키워드 전달
-                            evidence, ref_list = get_consensus_evidence(query, required_keywords=keywords)
+                            # 1차 검색 (좁은 범위)
+                            evidence, ref_list = get_consensus_evidence(q_specific)
                             
-                        except:
-                            # AI가 JSON 실패할 경우 대비 백업
-                            evidence = "검증 데이터 생성 실패"
+                            # [로직] 결과가 3개 미만이면 -> 넓은 범위 검색 추가 실행!
+                            if len(ref_list) < 3:
+                                ev_broad, ref_broad = get_consensus_evidence(q_broad)
+                                evidence += f"\n\n[추가 근거 (상위/유사 계열)]: {q_broad}\n" + ev_broad
+                                
+                                # 중복 제거하며 리스트 합치기
+                                existing_urls = [r['url'] for r in ref_list]
+                                for item in ref_broad:
+                                    if item['url'] not in existing_urls:
+                                        # 인덱스 번호 조정
+                                        item['index'] = len(ref_list) + 1
+                                        ref_list.append(item)
+                                        
+                        except Exception as e:
+                            evidence = f"검증 데이터 생성 실패: {e}"
                             ref_list = []
 
-                    with st.spinner("3. 글 작성 중..."):
+                    # 3. 글 작성 (비교/보완 관점 추가)
+                    with st.spinner("3. 심층 칼럼 작성 중..."):
                         final_prompt = f"""
-                        당신은 전문 의학 블로거입니다. 
-                        [상태] {status_msg}
-                        [본문] {content_source[:25000]}
-                        [검증자료 (Consensus)]
-                        {evidence}
+                        당신은 임상 한의학 전문 작가입니다. 
+                        제공된 [논문]과 [검증자료]를 종합하여 블로그 글을 작성하세요.
+
+                        [상황] {status_msg}
+                        [메인 논문] {content_source[:25000]}
                         
-                        위 내용을 바탕으로 {'전문가(한의사)' if '전문가' in target_type else '일반 환자'} 대상의 블로그 글을 쓰세요.
-                        본문의 내용은 '검증자료'의 [Ref 1], [Ref 2] 등을 인용하여 신뢰도를 높이세요.
+                        [검증 자료 (Consensus)] 
+                        {evidence}
+
+                        [작성 핵심 지침 - 비교와 보완]
+                        1. 메인 논문의 중재(예: 소풍산)에 대한 직접적인 연구가 부족하다면, 검증 자료에 있는 **'유사 계열(예: 한약 전반, 다른 처방)'의 효과와 비교**하여 서술하세요. 혹은 메인 논문의 중재와 같지만 다른 종류의 질병에 영향을 주는 경우와 비교해서 서술하되, 근거가 부족하면 넘기세요.
+                        2. 예시 멘트: "소풍산 자체에 대한 연구는 적지만, 유사한 청열제 계열의 한약들은 아토피의 소양감 완화에 유의미한 근거(Ref 3, 4)를 가지고 있습니다."
+                        3. 이를 통해 이 치료법이 임상적으로 타당한지 독자(한의사)를 설득하세요.
+                        4. 마지막에는 [Reference] 리스트를 달지 마세요. (시스템이 알아서 답니다.)
                         """
                         article = client.chat.completions.create(model=b_model, messages=[{"role":"user","content":final_prompt}]).choices[0].message.content
                         
-                        # [핵심] 글 끝에 참고문헌 리스트 자동 부착
+                        # 참고문헌 부착
                         if ref_list:
                             article += "\n\n---\n### 📚 참고 문헌 (References)\n"
                             article += f"**[Main]** {target_paper['title_kr']} (PMID: {target_paper['pmid']})\n"
@@ -424,7 +448,7 @@ with tab_blog:
                                 article += f"{ref['index']}. [{ref['title']}]({ref['url']})\n"
 
                         save_blog_post(b_date_str, "doctor" if "전문가" in target_type else "patient", article)
-                        st.success(f"작성 완료! ({len(ref_list)}개의 참고문헌이 추가됨)")
+                        st.success(f"작성 완료! (참고문헌 {len(ref_list)}건 확보)")
                         st.rerun()
 
     with c_b2:
@@ -535,4 +559,5 @@ if __name__ == "__main__":
         db.pull_db()
         st.session_state.db_synced = True
     migrate_db()
+
 
