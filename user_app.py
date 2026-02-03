@@ -7,6 +7,8 @@ from datetime import datetime
 # ===================== [설정] =====================
 st.set_page_config(page_title="한의학 논문 AI 큐레이터", layout="wide", page_icon="🏥")
 DB_NAME = 'kmd_papers_v5_column.db'
+# 앱 시작하자마자 최신 DB 다운로드
+db.pull_db()
 
 # 스타일 커스텀 (반응형 & 제작자 표시)
 st.markdown("""
