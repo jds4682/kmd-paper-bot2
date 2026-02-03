@@ -4,4 +4,5 @@ streamlit
 openai
 biopython
 requests
-requests
+
+
