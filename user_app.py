@@ -23,10 +23,8 @@ try:
     ADMIN_PW = st.secrets["admin"]["pw"]
 except Exception as e:
     # 로컬 테스트용 (secrets 파일이 없을 때 대비) 또는 에러 처리
-    # st.error("관리자 설정(Secrets)이 없습니다.")
-    ADMIN_ID = "admin" 
-    ADMIN_PW = "임시비밀번호" # 배포 후에는 작동 안 함, 로컬용 예비
-
+    #st.error("관리자 설정(Secrets)이 없습니다.")
+    
 # 스타일 커스텀
 st.markdown("""
     <style>
