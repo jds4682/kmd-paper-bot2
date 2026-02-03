@@ -14,9 +14,12 @@ import db_handler as db  # [중요] DB 핸들러 임포트
 # ===================== [앱 시작 시 DB 동기화] =====================
 # 앱이 켜질 때 GitHub에서 최신 DB 파일을 받아옵니다.
 if 'db_synced' not in st.session_state:
-    with st.spinner("서버와 데이터 동기화 중..."):
-        db.pull_db()
-    st.session_state.db_synced = True
+    try:
+        with st.spinner("데이터 동기화 중..."):
+            db.pull_db()
+        st.session_state.db_synced = True
+    except Exception as e:
+        st.warning(f"DB 동기화 실패: {e}")
 
 # ===================== [설정 및 초기화] =====================
 st.set_page_config(page_title="한의학 논문 AI 큐레이터 Pro", layout="wide", page_icon="🏥")
@@ -503,3 +506,4 @@ if __name__ == "__main__":
     if not st.session_state.get('db_synced'):
         db.pull_db()
         st.session_state.db_synced = True
+
