@@ -4,3 +4,4 @@ biopython
 requests
 pandas
 PyGithub
+PyPDF2
