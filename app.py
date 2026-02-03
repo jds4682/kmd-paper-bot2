@@ -4,14 +4,28 @@ import pandas as pd
 import json
 import re
 import requests
+import urllib.parse  # [추가] URL 인코딩용
 from Bio import Entrez
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from openai import OpenAI
 import time
+import PyPDF2  # [추가] PDF 읽기용
 import db_handler as db  # [중요] DB 핸들러 임포트
 
-# ===================== [0. 무료 파이썬 분석기 추가] =====================
+# ===================== [0. 초기 설정] =====================
+st.set_page_config(page_title="한의학 논문 AI 큐레이터 Pro", layout="wide", page_icon="🏥")
+
+# 앱이 켜질 때 GitHub에서 최신 DB 파일을 받아옵니다.
+if 'db_synced' not in st.session_state:
+    try:
+        with st.spinner("데이터 동기화 중..."):
+            db.pull_db()
+        st.session_state.db_synced = True
+    except Exception as e:
+        st.warning(f"DB 동기화 실패: {e}")
+
+# ===================== [1. 무료 파이썬 분석기] =====================
 def analyze_metadata_free(text, title):
     """AI 없이 파이썬으로 N수, P값, 태그 등을 추출"""
     text_lower = text.lower() if text else ""
@@ -36,19 +50,44 @@ def analyze_metadata_free(text, title):
     # 리스트를 문자열로 변환해서 저장
     meta["tags_str"] = ", ".join(meta["tags"])
     return meta
-# ===================== [앱 시작 시 DB 동기화] =====================
-# 앱이 켜질 때 GitHub에서 최신 DB 파일을 받아옵니다.
-if 'db_synced' not in st.session_state:
+
+# ===================== [2. NEW: 추가된 심층 분석 도구들] =====================
+
+# 2-1. PDF 텍스트 추출기 [추가됨]
+def read_pdf_file(uploaded_file):
     try:
-        with st.spinner("데이터 동기화 중..."):
-            db.pull_db()
-        st.session_state.db_synced = True
-    except Exception as e:
-        st.warning(f"DB 동기화 실패: {e}")
+        reader = PyPDF2.PdfReader(uploaded_file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text[:30000] # 토큰 절약을 위해 3만자 제한
+    except: return None
 
-# ===================== [설정 및 초기화] =====================
-st.set_page_config(page_title="한의학 논문 AI 큐레이터 Pro", layout="wide", page_icon="🏥")
+# 2-2. 미니 Consensus (PubMed 교차검증) [추가됨]
+def get_consensus_evidence(topic_query):
+    """주제와 관련된 최신 메타분석/RCT 5개를 찾아옵니다 (비용 0원)"""
+    try:
+        # 최근 5년 내의 SR, Meta-analysis, RCT 검색
+        search_term = f"({topic_query}) AND (Systematic Review[ptyp] OR Meta-Analysis[ptyp] OR Randomized Controlled Trial[ptyp]) AND (\"2020\"[Date - Publication] : \"3000\"[Date - Publication])"
+        handle = Entrez.esearch(db="pubmed", term=search_term, retmax=5, sort="relevance")
+        record = Entrez.read(handle)
+        id_list = record["IdList"]
+        
+        if not id_list: return "관련된 추가 근거 논문이 검색되지 않았습니다."
 
+        handle = Entrez.efetch(db="pubmed", id=id_list, rettype="medline", retmode="xml")
+        records = Entrez.read(handle)
+        
+        evidence_text = ""
+        for idx, article in enumerate(records['PubmedArticle']):
+            title = article['MedlineCitation']['Article']['ArticleTitle']
+            abstract_list = article['MedlineCitation']['Article'].get('Abstract', {}).get('AbstractText', [])
+            abstract = " ".join(abstract_list) if abstract_list else ""
+            evidence_text += f"\n[근거 {idx+1}] {title}\n요약: {abstract[:200]}...\n"
+        return evidence_text
+    except: return "교차 검증 데이터 로딩 실패"
+
+# ===================== [UI 사이드바] =====================
 with st.sidebar:
     st.header("⚙️ 기본 설정")
     openai_api_key = st.text_input("OpenAI API Key", type="password")
@@ -56,35 +95,25 @@ with st.sidebar:
     
     st.divider()
     st.header("📢 텔레그램 설정")
-    st.caption("단톡방 ID는 보통 마이너스(-)로 시작합니다.")
     telegram_token = st.text_input("Bot Token", type="password")
     chat_id = st.text_input("Chat ID")
 
 Entrez.email = email_address
 DB_NAME = 'kmd_papers_v5_column.db' 
 
-# ===================== [1. DB 관리] =====================
-# ===================== [DB 마이그레이션] =====================
+# ===================== [3. DB 관리 & 마이그레이션] =====================
 def migrate_db():
     """기존 DB에 새로운 컬럼(n_count, tags 등)이 없으면 추가"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    # 추가할 컬럼 목록
     new_columns = [
-        ("n_count", "TEXT"),
-        ("p_value", "TEXT"),
-        ("tags", "TEXT"),
-        ("user_note", "TEXT")
+        ("n_count", "TEXT"), ("p_value", "TEXT"), 
+        ("tags", "TEXT"), ("user_note", "TEXT")
     ]
-    
     for col, dtype in new_columns:
         try:
             cursor.execute(f"ALTER TABLE papers ADD COLUMN {col} {dtype}")
-            # st.toast(f"🎉 DB 업데이트: {col} 항목 추가됨") # 알림이 너무 많이 뜨면 주석 처리
-        except sqlite3.OperationalError:
-            pass # 이미 있으면 패스
-            
+        except sqlite3.OperationalError: pass
     conn.commit()
     conn.close()
 
@@ -93,14 +122,12 @@ def get_papers_by_date(target_date_str):
     try:
         query = "SELECT * FROM papers WHERE date_published = ?"
         df = pd.read_sql(query, conn, params=(target_date_str,))
-    except:
-        df = pd.DataFrame()
+    except: df = pd.DataFrame()
     conn.close()
     return df
 
 def get_daily_column(date_str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB_NAME); cursor = conn.cursor()
     try:
         cursor.execute("SELECT content FROM daily_columns WHERE date_id = ?", (date_str,))
         result = cursor.fetchone()
@@ -109,18 +136,13 @@ def get_daily_column(date_str):
     finally: conn.close()
 
 def save_daily_column(date_str, content):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB_NAME); cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO daily_columns VALUES (?, ?, ?)", 
                    (date_str, content, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    conn.commit()
-    conn.close()
-    # [중요] 저장 후 GitHub 업로드
-    db.push_db()
+    conn.commit(); conn.close(); db.push_db()
 
 def get_blog_post(date_str, target_type):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB_NAME); cursor = conn.cursor()
     try:
         cursor.execute("SELECT content FROM blog_posts WHERE date_id = ? AND target_type = ?", (date_str, target_type))
         result = cursor.fetchone()
@@ -129,35 +151,27 @@ def get_blog_post(date_str, target_type):
     finally: conn.close()
 
 def save_blog_post(date_str, target_type, content):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB_NAME); cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO blog_posts VALUES (?, ?, ?, ?)", 
                    (date_str, target_type, content, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    conn.commit()
-    conn.close()
-    # [중요] 저장 후 GitHub 업로드
-    db.push_db()
+    conn.commit(); conn.close(); db.push_db()
 
 def delete_papers(pmid_list):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB_NAME); cursor = conn.cursor()
     if pmid_list:
         placeholders = ', '.join('?' for _ in pmid_list)
         cursor.execute(f"DELETE FROM papers WHERE pmid IN ({placeholders})", pmid_list)
         conn.commit()
-    conn.close()
-    # [중요] 삭제 후 GitHub 업로드
-    db.push_db()
+    conn.close(); db.push_db()
 
 def check_if_exists(pmid):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB_NAME); cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM papers WHERE pmid=?", (pmid,))
     exists = cursor.fetchone() is not None
     conn.close()
     return exists
 
-# ===================== [2. Full Text Fetcher] =====================
+# ===================== [4. Full Text Fetcher] =====================
 def fetch_pmc_fulltext(pmid):
     try:
         link_results = Entrez.elink(dbfrom="pubmed", db="pmc", id=pmid)
@@ -168,22 +182,16 @@ def fetch_pmc_fulltext(pmid):
         xml_data = handle.read()
         root = ET.fromstring(xml_data)
         full_text = "".join([text for body in root.findall(".//body") for text in body.itertext()])
-        return full_text[:25000] if len(full_text) > 500 else None, "✅ Full Text (PMC)"
-    except Exception as e:
-        return None, f"Error: {str(e)}"
+        return full_text[:30000] if len(full_text) > 500 else None, "✅ PMC 전문(Full Text) 분석됨"
+    except Exception as e: return None, f"Error: {str(e)}"
 
-# ===================== [3. AI 분석 로직] =====================
+# ===================== [5. AI 분석 로직] =====================
 def analyze_paper_strict(paper_data, api_key):
     client = OpenAI(api_key=api_key)
     prompt = f"""
     너는 임상 한의학 논문 분류 전문가다.
-    
-    [필수 규칙 1: 중재법 분류]
-    - 침, 뜸, 부항, 한약, 약침, 추나 중 택1. 해당 없으면 "기타".
-
-    [필수 규칙 2: 신체부위 분류]
-    - 두경부, 척추/허리, 상지, 하지, 내장기/전신 중 택1.
-
+    [필수 규칙 1: 중재법 분류] 침, 뜸, 부항, 한약, 약침, 추나 중 택1. 해당 없으면 "기타".
+    [필수 규칙 2: 신체부위 분류] 두경부, 척추/허리, 상지, 하지, 내장기/전신 중 택1.
     [JSON 형식]
     {{
         "korean_title": "한글 제목",
@@ -196,23 +204,17 @@ def analyze_paper_strict(paper_data, api_key):
         "icd_code": "코드",
         "full_text_status": "Abstract Check"
     }}
-
     Title: {paper_data['title']}
     Abstract: {paper_data['abstract']}
     """
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
-        )
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.0)
         data = json.loads(re.search(r'\{.*\}', response.choices[0].message.content.strip(), re.DOTALL).group())
         if "DROP" in str(data.get("study_design", "")): return {"error": "DROP: 임상 연구 아님"}
         return data
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as e: return {"error": str(e)}
 
-# ===================== [4. PubMed 검색] =====================
+# ===================== [6. PubMed 검색] =====================
 def simple_keyword_classify(text):
     text = text.lower()
     if "acupuncture" in text or "needling" in text: return "침"
@@ -236,11 +238,7 @@ def search_pubmed_raw(start_date, end_date, max_results):
         handle = Entrez.esearch(db="pubmed", term=search_term, mindate=str_start, maxdate=str_end, datetype="pdat", retmax=max_results)
         record = Entrez.read(handle)
         id_list = record["IdList"]
-    except: return []
-
-    if not id_list: return []
-
-    try:
+        if not id_list: return []
         handle = Entrez.efetch(db="pubmed", id=id_list, rettype="medline", retmode="xml")
         records = Entrez.read(handle)
     except: return []
@@ -263,11 +261,10 @@ def search_pubmed_raw(start_date, end_date, max_results):
         except: continue
     return raw_papers
 
-# ===================== [5. 데일리 브리핑 생성기] =====================
+# ===================== [7. 데일리 브리핑 생성기] =====================
 def generate_daily_briefing_pro_v3(date_str, papers_df, api_key, model_choice):
     client = OpenAI(api_key=api_key)
     top_papers = papers_df.sort_values(by='clinical_score', ascending=False).head(10)
-    
     if top_papers.empty: return "분석할 논문이 없습니다."
 
     analyzed_data = []
@@ -282,87 +279,54 @@ def generate_daily_briefing_pro_v3(date_str, papers_df, api_key, model_choice):
         content_source = full_text if full_text else row['abstract']
         
         pico_prompt = f"""
-        이 논문을 PICO 구조로 분석하라.
-        [규칙] Full Name 변환 및 수치 정보 포함.
+        이 논문을 PICO 구조로 분석하라. [규칙] Full Name 변환 및 수치 정보 포함.
         Title: {row['title_kr']}
         Text: {content_source[:15000]}
         """
         try:
             pico_res_text = client.chat.completions.create(
-                model="gpt-4o-mini", 
-                messages=[{"role": "user", "content": pico_prompt}],
-                temperature=0.0
+                model="gpt-4o-mini", messages=[{"role": "user", "content": pico_prompt}], temperature=0.0
             ).choices[0].message.content
         except: pico_res_text = "분석 실패"
 
         analyzed_data.append({
-            "pmid": row['pmid'],
-            "title": row['title_kr'],
-            "score": row['clinical_score'],
-            "study_design": row['study_design'],
-            "source": ft_status,
-            "detail_analysis": pico_res_text
+            "pmid": row['pmid'], "title": row['title_kr'], "score": row['clinical_score'],
+            "study_design": row['study_design'], "source": ft_status, "detail_analysis": pico_res_text
         })
 
-    status_text.empty()
-    prog_bar.empty()
+    status_text.empty(); prog_bar.empty()
 
     final_prompt = f"""
     당신은 한의학 에디터입니다. 상위 7개(Pick 2 + News 5) 논문 브리핑을 작성하세요.
     [필수] 원문 링크 포함: `🔗 원문: https://pubmed.ncbi.nlm.nih.gov/[PMID]`
-    
     [출력 포맷]
     📅 **{date_str} 한의 임상 브리핑**
-    
     🥇 **Today's Pick 1: [제목]**
     ([연구유형] / ⭐[점수])
     - 🎯 **Point:** ...
     - 💊 **Method:** ...
     - 📊 **Result:** ...
     - 🔗 **원문:** https://pubmed.ncbi.nlm.nih.gov/[PMID]
-    
     [입력 데이터]
     {json.dumps(analyzed_data, ensure_ascii=False)}
     """
-    
     try:
-        if "o1" in model_choice:
-            return client.chat.completions.create(model=model_choice, messages=[{"role": "user", "content": final_prompt}]).choices[0].message.content
-        else:
-            return client.chat.completions.create(model=model_choice, messages=[{"role": "user", "content": final_prompt}], temperature=0.7).choices[0].message.content
+        return client.chat.completions.create(model=model_choice, messages=[{"role": "user", "content": final_prompt}]).choices[0].message.content
     except Exception as e: return f"생성 실패: {e}"
 
-# ===================== [6. 블로그 아티클 생성기] =====================
-def generate_blog_article(date_str, papers_df, api_key, model_choice, target_audience="doctor"):
-    client = OpenAI(api_key=api_key)
-    top_paper = papers_df.sort_values(by='clinical_score', ascending=False).iloc[0]
-    full_text, ft_status = fetch_pmc_fulltext(top_paper['pmid'])
-    content_source = full_text if full_text else top_paper['abstract']
-    
-    prompt = f"""
-    당신은 전문 의학 블로거입니다. 이 논문으로 블로그 글을 작성하세요.
-    타겟: {'전문가(한의사)' if target_audience == 'doctor' else '일반 환자'}
-    
-    [논문 정보]
-    제목: {top_paper['title_kr']}
-    PMID: {top_paper['pmid']}
-    내용: {content_source[:20000]}
-    """
-    
-    try:
-        if "o1" in model_choice:
-            return client.chat.completions.create(model=model_choice, messages=[{"role": "user", "content": prompt}]).choices[0].message.content
-        else:
-            return client.chat.completions.create(model=model_choice, messages=[{"role": "user", "content": prompt}], temperature=0.7).choices[0].message.content
-    except Exception as e: return f"블로그 생성 실패: {e}"
+# ===================== [8. (업그레이드된) 블로그 아티클 생성기] =====================
+# 기존 generate_blog_article을 삭제하고, 이 함수를 사용합니다.
+# 하지만 탭 내부 로직에서 직접 구현하므로 여기서는 헬퍼 함수로 남겨둡니다.
 
-# ===================== [7. UI 구성] =====================
+# ===================== [9. 메인 UI 및 탭 구성] =====================
+migrate_db() # 앱 실행 시 DB 구조 자동 업데이트
+
 st.title("🏥 한의학 논문 AI 큐레이터 Pro")
 st.markdown("---")
 
 tab_briefing, tab_blog, tab_archive, tab_search = st.tabs(["📝 데일리 브리핑", "✍️ 블로그/수익화", "📚 보관함", "🔎 검색"])
 
-# --- [Tab 1: 데일리 브리핑 & 텔레그램] ---
+# --- [Tab 1: 데일리 브리핑] ---
 with tab_briefing:
     c1, c2 = st.columns([1, 2])
     with c1:
@@ -371,7 +335,6 @@ with tab_briefing:
         target_date_str = target_date.strftime("%Y-%m-%d")
         daily_papers = get_papers_by_date(target_date_str)
         st.info(f"논문 수: {len(daily_papers)}건")
-        
         model_option = st.radio("AI 모델:", ["gpt-4o", "o1-preview", "gpt-4o-mini"], index=0)
         
         if st.button("✨ 안전 모드 브리핑 생성"):
@@ -380,13 +343,11 @@ with tab_briefing:
             else:
                 briefing = generate_daily_briefing_pro_v3(target_date_str, daily_papers, openai_api_key, model_option)
                 save_daily_column(target_date_str, briefing)
-                st.success("브리핑 생성 및 저장 완료!") # GitHub 업로드 됨
+                st.success("완료!")
                 st.rerun()
-
     with c2:
         st.subheader("📨 공유 및 전송")
         content = get_daily_column(target_date_str)
-        
         if content:
             st.markdown("##### 🚀 텔레그램 전송")
             user_footer = st.text_area("📢 추가 코멘트", height=70)
@@ -394,126 +355,132 @@ with tab_briefing:
             if user_footer: final_msg += f"\n\n--------------------------------\n📢 **Editor's Note**\n{user_footer}"
 
             if st.button("✈️ 텔레그램 전송", type="primary"):
-                if not telegram_token or not chat_id:
-                    st.error("설정에서 토큰/ID를 입력하세요.")
+                if not telegram_token or not chat_id: st.error("토큰 필요")
                 else:
                     try:
                         url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
                         res = requests.post(url, json={"chat_id": chat_id, "text": final_msg, "parse_mode": "Markdown"})
-                        if res.status_code == 200: st.toast("전송 성공!"); st.success("전송 완료")
+                        if res.status_code == 200: st.success("전송 완료")
                         else: st.error(f"실패: {res.text}")
                     except Exception as e: st.error(f"에러: {e}")
-
             st.divider()
-            st.code(final_msg, language='markdown')
-            with st.expander("미리보기"): st.markdown(final_msg)
-        else:
-            st.warning("생성된 브리핑이 없습니다.")
+            st.markdown(final_msg)
+        else: st.warning("브리핑 없음")
 
-# --- [Tab 2: 블로그] ---
+# --- [Tab 2: 블로그 (심층 분석 + PDF 업로드)] ---
 with tab_blog:
     c_b1, c_b2 = st.columns([1, 3])
     with c_b1:
-        st.subheader("✒️ 블로그 생성")
+        st.subheader("✒️ 심층 블로그 생성")
         b_date = st.date_input("날짜", value=datetime.now(), key="blog_date")
         b_date_str = b_date.strftime("%Y-%m-%d")
         b_papers = get_papers_by_date(b_date_str)
         st.info(f"후보: {len(b_papers)}건")
-        b_model = st.selectbox("모델:", ["gpt-4o", "o1-preview"], index=0)
-        target_type = st.radio("타겟:", ["👨‍⚕️ 전문가용", "😊 환자용"])
         
-        if st.button("✍️ 글 생성"):
-            if b_papers.empty: st.error("논문 없음")
-            elif not openai_api_key: st.error("Key 없음")
-            else:
-                with st.spinner("작성 중..."):
-                    article = generate_blog_article(b_date_str, b_papers, openai_api_key, b_model, "doctor" if "전문가" in target_type else "patient")
-                    save_blog_post(b_date_str, "doctor" if "전문가" in target_type else "patient", article)
-                    st.success("완료! (GitHub 자동 저장됨)")
-                    st.rerun()
+        # [NEW] 논문 선택 및 PDF 업로드 기능 추가
+        if not b_papers.empty:
+            sel_title = st.selectbox("논문 선택", b_papers['title_kr'].tolist())
+            target_paper = b_papers[b_papers['title_kr'] == sel_title].iloc[0]
+            uploaded_pdf = st.file_uploader("📄 PDF 업로드 (선택)", type="pdf")
+            b_model = st.selectbox("모델:", ["gpt-4o", "gpt-4o-mini"], index=0)
+            target_type = st.radio("타겟:", ["👨‍⚕️ 전문가용", "😊 환자용"])
+
+            if st.button("🚀 심층 분석 & 글쓰기"):
+                if not openai_api_key: st.error("Key 없음")
+                else:
+                    with st.spinner("1. 자료 분석 중..."):
+                        status_msg = "초록(Abstract) 기반"
+                        content_source = target_paper['abstract']
+                        
+                        # PDF 우선
+                        if uploaded_pdf:
+                            pdf_txt = read_pdf_file(uploaded_pdf)
+                            if pdf_txt: 
+                                content_source = pdf_txt
+                                status_msg = "📂 PDF 전문 분석"
+                        # PMC 차선
+                        elif not uploaded_pdf:
+                            pmc_txt, pmc_msg = fetch_pmc_fulltext(target_paper['pmid'])
+                            if pmc_txt:
+                                content_source = pmc_txt
+                                status_msg = pmc_msg
+
+                    with st.spinner("2. Consensus 교차 검증 중..."):
+                        client = OpenAI(api_key=openai_api_key)
+                        q_prompt = f"Extract a search query to verify efficacy: {content_source[:1000]}"
+                        query = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":q_prompt}]).choices[0].message.content
+                        evidence = get_consensus_evidence(query)
+
+                    with st.spinner("3. 글 작성 중..."):
+                        final_prompt = f"""
+                        당신은 전문 의학 블로거입니다. 
+                        [상태] {status_msg}
+                        [본문] {content_source[:25000]}
+                        [검증자료] {evidence}
+                        위 내용을 바탕으로 {'전문가(한의사)' if '전문가' in target_type else '일반 환자'} 대상의 블로그 글을 쓰세요.
+                        검증 자료를 활용해 신뢰도를 높이세요.
+                        """
+                        article = client.chat.completions.create(model=b_model, messages=[{"role":"user","content":final_prompt}]).choices[0].message.content
+                        save_blog_post(b_date_str, "doctor" if "전문가" in target_type else "patient", article)
+                        st.success(f"작성 완료! ({status_msg})")
+                        st.rerun()
 
     with c_b2:
         st.subheader("📄 미리보기")
         t1, t2 = st.tabs(["👨‍⚕️ 전문가용", "😊 환자용"])
         with t1:
             post = get_blog_post(b_date_str, "doctor")
-            if post: st.markdown(post); st.divider(); st.code(post)
-            else: st.info("없음")
+            if post: st.markdown(post)
         with t2:
             post = get_blog_post(b_date_str, "patient")
-            if post: st.markdown(post); st.divider(); st.code(post)
-            else: st.info("없음")
+            if post: st.markdown(post)
 
-# --- [Tab 3: 보관함 (필터 적용)] ---
+# --- [Tab 3: 보관함 (검증 버튼 추가)] ---
 with tab_archive:
-    # 1. DB에서 데이터 가져오기
     df_all = pd.read_sql("SELECT * FROM papers", sqlite3.connect(DB_NAME))
-    
-    if df_all.empty:
-        st.info("보관함이 비어있습니다.")
+    if df_all.empty: st.info("보관함이 비어있습니다.")
     else:
-        st.subheader("🔍 필터링")
-        
-        # 2. 필터 UI
+        st.subheader("🔍 필터링 & 편집")
         cats = sorted(df_all['intervention_category'].unique().tolist())
         sel_cats = st.multiselect("중재법 선택", cats, default=cats)
-        
-        if 'archive_body_part' not in st.session_state: st.session_state.archive_body_part = "전체"
-        def btn_col(part): return "primary" if st.session_state.archive_body_part == part else "secondary"
-        
-        parts = ["두경부", "척추/허리", "상지", "하지", "내장기/전신", "전체"]
-        cols = st.columns(6)
-        for i, part in enumerate(parts):
-            if cols[i].button(part, key=f"p_{i}", type=btn_col(part), use_container_width=True):
-                st.session_state.archive_body_part = part
-                st.rerun()
-
-        # 3. 데이터 필터링
         df_filt = df_all.copy()
         if sel_cats: df_filt = df_filt[df_filt['intervention_category'].isin(sel_cats)]
-        if st.session_state.archive_body_part != "전체":
-            df_filt = df_filt[df_filt['target_body_part'] == st.session_state.archive_body_part]
-
-        st.divider()
-        st.subheader(f"📚 목록 ({len(df_filt)}건)")
         
         if not df_filt.empty:
-            # 삭제 체크박스 및 URL 링크 생성
             df_filt.insert(0, "del", False)
             df_filt["url"] = "https://pubmed.ncbi.nlm.nih.gov/" + df_filt["pmid"]
             
-            # 4. 데이터 에디터 표시 (여기에 'date_published' 추가됨!)
             edited = st.data_editor(
                 df_filt,
                 column_config={
                     "del": st.column_config.CheckboxColumn("삭제", width="small"),
-                    "url": st.column_config.LinkColumn("Link", display_text="🔗", width="small"),
-                    "date_published": st.column_config.TextColumn("수집일", width="small"),
-                    "title_kr": st.column_config.TextColumn("제목", width="large"),
-                    # 새로 추가된 컬럼 설정
-                    "tags": st.column_config.TextColumn("태그", width="medium"), 
-                    "n_count": st.column_config.TextColumn("N수", width="small"),
-                    "user_note": st.column_config.TextColumn("메모", width="medium"), # 여기서 바로 메모 수정 가능!
+                    "url": st.column_config.LinkColumn("Link", display_text="🔗"),
+                    "tags": st.column_config.TextColumn("태그"),
+                    "n_count": st.column_config.TextColumn("N수"),
+                    "user_note": st.column_config.TextColumn("메모")
                 },
-                # 화면에 보여줄 컬럼 순서
-                column_order=[
-                    "del", "url", "clinical_score", "tags", "n_count", # 태그랑 N수를 앞쪽에 배치
-                    "title_kr", "intervention_category", "user_note"
-                ],
-                hide_index=True, 
-                use_container_width=True
+                column_order=["del", "url", "clinical_score", "tags", "n_count", "title_kr", "user_note"],
+                hide_index=True, use_container_width=True
             )
             
-            # 5. 삭제 로직
             if st.button("🗑️ 삭제 확인"):
                 to_del = edited[edited["del"]]['pmid'].tolist()
-                if to_del:
-                    delete_papers(to_del)
-                    st.success("삭제됨 (GitHub 자동 동기화)")
-                    st.rerun()
-        else: st.warning("조건에 맞는 논문이 없습니다.")
+                if to_del: delete_papers(to_del); st.success("삭제됨"); st.rerun()
 
-# --- [Tab 4: 검색] ---
+            # [NEW] 상세 검증 버튼 추가
+            st.divider()
+            st.caption("👇 논문 상세 검증 도구")
+            for _, row in df_filt.iterrows():
+                with st.expander(f"{row['title_kr']}"):
+                    st.info(row['summary'])
+                    c1, c2, c3 = st.columns(3)
+                    c1.link_button("📄 원문 보기", row['url'], use_container_width=True)
+                    
+                    q = urllib.parse.quote(row['original_title'])
+                    c2.link_button("⚖️ Consensus 팩트체크", f"https://consensus.app/results/?q={q}", use_container_width=True)
+                    c3.link_button("🤖 SciSpace 심층분석", f"https://typeset.io/search?q={q}", use_container_width=True)
+
+# --- [Tab 4: 검색 (무료 분석 포함)] ---
 with tab_search:
     c1, c2 = st.columns(2)
     with c1: s_date = st.date_input("시작", value=datetime.now()-timedelta(days=2))
@@ -530,8 +497,6 @@ with tab_search:
         edited = st.data_editor(df, column_config={"Sel": st.column_config.CheckboxColumn("선택")}, hide_index=True)
         targets = edited[edited["Sel"]]
         
-        # --- [Tab 4: 검색] 내부의 저장 버튼 부분 수정 ---
-
         if st.button(f"2. {len(targets)}건 분석 및 저장"):
             if not openai_api_key: st.error("Key 없음")
             else:
@@ -539,7 +504,7 @@ with tab_search:
                 bar = st.progress(0)
                 full_list = [p for p in st.session_state.search_res if p['pmid'] in targets['pmid'].tolist()]
                 
-                # 테이블 생성 (혹시 없을 경우를 대비해 컬럼 다 넣어서 정의)
+                # 테이블 생성 (새 컬럼 포함)
                 cur.execute('''CREATE TABLE IF NOT EXISTS papers (
                     pmid TEXT PRIMARY KEY, date_published TEXT, title_kr TEXT, 
                     intervention_category TEXT, target_body_part TEXT, specific_point TEXT, 
@@ -551,14 +516,13 @@ with tab_search:
                 for i, p in enumerate(full_list):
                     bar.progress((i+1)/len(full_list))
                     
-                    # 1. 유료 분석 (OpenAI)
+                    # 1. AI 분석 (유료)
                     res = analyze_paper_strict(p, openai_api_key)
                     
-                    # 2. 무료 분석 (Python) - 추가된 부분!
+                    # 2. 파이썬 무료 분석 (New)
                     meta = analyze_metadata_free(p['abstract'], p['title'])
                     
                     if "error" not in res:
-                        # INSERT 문에 새로운 컬럼 4개(n_count, p_value, tags, user_note) 추가
                         cur.execute('''
                             INSERT OR REPLACE INTO papers VALUES 
                             (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?) 
@@ -570,28 +534,15 @@ with tab_search:
                             res.get('summary'), p['title'], p['abstract'], 
                             res.get('icd_code'), "Abstract Saved",
                             
-                            # 새로 추가된 데이터 저장
-                            meta['n_count'], 
-                            meta['p_value'], 
-                            meta['tags_str'], 
-                            "" # user_note는 처음에 빈칸
+                            # 추가 데이터
+                            meta['n_count'], meta['p_value'], meta['tags_str'], ""
                         ))
                         conn.commit()
-                
-                conn.close()
-                db.push_db() # GitHub 동기화
-                
-                st.success(f"분석 완료! (태그, N수 자동 추출됨)")
-                st.session_state.search_res = None
-                time.sleep(1)
-                st.rerun()
+                conn.close(); db.push_db()
+                st.success("저장 완료!"); st.session_state.search_res = None; st.rerun()
 
-# 앱 실행 시 DB 체크 (임포트 시 실행되지만 안전상 한 번 더)
 if __name__ == "__main__":
     if not st.session_state.get('db_synced'):
         db.pull_db()
         st.session_state.db_synced = True
-    migrate_db() # <--- 여기 추가! (앱 켜질 때 DB 구조 최신화)
-
-
-
+    migrate_db()
