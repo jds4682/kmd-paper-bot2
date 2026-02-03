@@ -55,11 +55,16 @@ def read_pdf_file(uploaded_file):
     except: return None
 
 # [업그레이드] 링크 생성을 위해 URL 정보도 함께 반환하도록 수정됨
-def get_consensus_evidence(topic_query):
-    """주제와 관련된 최신 메타분석/RCT 5개를 찾고, 링크 리스트도 반환"""
+def get_consensus_evidence(topic_query, required_keywords=[]):
+    """
+    주제(Query)로 검색하되, 결과 논문 제목에 required_keywords(핵심단어)가 
+    하나라도 포함되어 있지 않으면 '가짜 결과'로 간주하고 버립니다.
+    """
     try:
-        search_term = f"({topic_query}) AND (Systematic Review[ptyp] OR Meta-Analysis[ptyp] OR Randomized Controlled Trial[ptyp]) AND (\"2020\"[Date - Publication] : \"3000\"[Date - Publication])"
-        handle = Entrez.esearch(db="pubmed", term=search_term, retmax=5, sort="relevance")
+        # 검색어: (주제) AND (RCT/Review) AND (최신 5년)
+        search_term = f"({topic_query}) AND (Systematic Review[ptyp] OR Meta-Analysis[ptyp] OR Randomized Controlled Trial[ptyp]) AND (\"2015\"[Date - Publication] : \"3000\"[Date - Publication])"
+        
+        handle = Entrez.esearch(db="pubmed", term=search_term, retmax=10, sort="relevance") # 10개 넉넉히 가져옴
         record = Entrez.read(handle)
         id_list = record["IdList"]
         
@@ -69,26 +74,51 @@ def get_consensus_evidence(topic_query):
         records = Entrez.read(handle)
         
         evidence_text = ""
-        ref_list = [] # 링크 생성을 위한 리스트
+        ref_list = []
+        valid_count = 0
         
-        for idx, article in enumerate(records['PubmedArticle']):
-            pmid = str(article['MedlineCitation']['PMID'])
-            title = article['MedlineCitation']['Article']['ArticleTitle']
-            abstract_list = article['MedlineCitation']['Article'].get('Abstract', {}).get('AbstractText', [])
-            abstract = " ".join(abstract_list) if abstract_list else ""
+        for article in records['PubmedArticle']:
+            try:
+                title = article['MedlineCitation']['Article']['ArticleTitle']
+                abstract_list = article['MedlineCitation']['Article'].get('Abstract', {}).get('AbstractText', [])
+                abstract = " ".join(abstract_list) if abstract_list else ""
+                
+                # [🛡️ 핵심: 안전장치] 제목에 핵심 키워드가 있는지 검사
+                # 예: required_keywords = ['allergic', 'rhinitis']
+                # 제목이 "Kidney disease..." 이면 -> 탈락!
+                is_relevant = False
+                if not required_keywords: # 키워드 없으면 그냥 통과
+                    is_relevant = True
+                else:
+                    for keyword in required_keywords:
+                        if keyword.lower() in title.lower():
+                            is_relevant = True
+                            break
+                
+                if not is_relevant:
+                    continue # 키워드 없으면 스킵하고 다음 논문 봄
+
+                # 검증 통과한 논문만 추가
+                valid_count += 1
+                evidence_text += f"\n[Ref {valid_count}] {title}\n요약: {abstract[:200]}...\n"
+                
+                pmid = str(article['MedlineCitation']['PMID'])
+                ref_list.append({
+                    "index": valid_count,
+                    "title": title,
+                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}"
+                })
+                
+                if valid_count >= 5: break # 5개 채우면 종료
+                
+            except: continue
             
-            # AI에게 줄 텍스트
-            evidence_text += f"\n[Ref {idx+1}] {title}\n요약: {abstract[:200]}...\n"
-            
-            # 나중에 글 하단에 붙일 링크 정보
-            ref_list.append({
-                "index": idx + 1,
-                "title": title,
-                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}"
-            })
+        if valid_count == 0:
+            return "검색 결과가 있었으나, 주제와 정확히 일치하는 논문은 없었습니다.", []
             
         return evidence_text, ref_list
-    except: return "교차 검증 데이터 로딩 실패", []
+        
+    except Exception as e: return f"교차 검증 중 오류: {str(e)}", []
 
 # ===================== [UI 사이드바] =====================
 with st.sidebar:
@@ -343,11 +373,35 @@ with tab_blog:
 
                     with st.spinner("2. Consensus 교차 검증 중..."):
                         client = OpenAI(api_key=openai_api_key)
-                        q_prompt = f"Extract a search query to verify efficacy: {content_source[:1000]}"
-                        query = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":q_prompt}]).choices[0].message.content
                         
-                        # [중요] 근거 텍스트와 함께 '링크 리스트'도 받아옴
-                        evidence, ref_list = get_consensus_evidence(query)
+                        # [수정] AI에게 검색어와 함께 '검증 키워드'도 달라고 요청 (JSON 포맷)
+                        q_prompt = f"""
+                        Analyze this text and generate two things for PubMed search:
+                        1. A specific search query (English) to verify efficacy.
+                        2. A list of 2-3 essential keywords (English) that MUST appear in the reference titles (e.g., disease name, intervention).
+                        
+                        Text: {content_source[:2000]}
+                        
+                        Output JSON format:
+                        {{
+                            "query": "(Intervention) AND (Disease)",
+                            "keywords": ["keyword1", "keyword2"]
+                        }}
+                        """
+                        try:
+                            q_resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":q_prompt}], temperature=0.0).choices[0].message.content
+                            q_json = json.loads(re.search(r'\{.*\}', q_resp, re.DOTALL).group())
+                            
+                            query = q_json['query']
+                            keywords = q_json['keywords']
+                            
+                            # [수정] 함수 호출 시 키워드 전달
+                            evidence, ref_list = get_consensus_evidence(query, required_keywords=keywords)
+                            
+                        except:
+                            # AI가 JSON 실패할 경우 대비 백업
+                            evidence = "검증 데이터 생성 실패"
+                            ref_list = []
 
                     with st.spinner("3. 글 작성 중..."):
                         final_prompt = f"""
@@ -481,3 +535,4 @@ if __name__ == "__main__":
         db.pull_db()
         st.session_state.db_synced = True
     migrate_db()
+
