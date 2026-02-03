@@ -1,0 +1,32 @@
+name: Daily KMD Briefing
+
+on:
+  schedule:
+    # 매일 아침 8시 (한국시간) 실행
+    # GitHub 서버 시간은 UTC이므로, 한국 8시는 UTC 23시 (전날)
+    - cron: '0 23 * * *' 
+  workflow_dispatch: # 수동 실행 버튼 추가
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Automation Script
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python daily_bot.py
