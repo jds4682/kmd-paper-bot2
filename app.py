@@ -3,6 +3,7 @@ import sqlite3
 import pandas as pd
 import json
 import re
+import requests # 텔레그램 전송용
 from Bio import Entrez
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -13,20 +14,25 @@ import time
 st.set_page_config(page_title="한의학 논문 AI 큐레이터 Pro", layout="wide", page_icon="🏥")
 
 with st.sidebar:
-    st.header("⚙️ 설정")
+    st.header("⚙️ 기본 설정")
     openai_api_key = st.text_input("OpenAI API Key", type="password")
     email_address = st.text_input("Email (PubMed용)", value="your_email@example.com")
-    st.info("💡 Top 논문은 원문(Full Text)을 확보하여 심층 분석합니다.")
+    
+    st.divider()
+    st.header("📢 텔레그램 설정")
+    st.caption("브리핑을 전송할 봇 정보를 입력하세요.")
+    telegram_token = st.text_input("Bot Token", type="password", help="BotFather에게 받은 토큰")
+    chat_id = st.text_input("Chat ID", help="userinfobot에게 받은 숫자 ID")
 
 Entrez.email = email_address
 DB_NAME = 'kmd_papers_v5_column.db' 
 
-# ===================== [1. DB 관리 (자동 업데이트 기능 추가)] =====================
+# ===================== [1. DB 관리] =====================
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # 1. 논문 테이블 생성 (기본)
+    # 1. 논문 테이블
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS papers (
             pmid TEXT PRIMARY KEY,
@@ -45,17 +51,6 @@ def init_db():
         )
     ''')
     
-    # 🚨 DB 마이그레이션 (에러 해결 핵심 로직)
-    # 기존 DB에 'full_text_status' 컬럼이 없으면 추가해주는 코드
-    cursor.execute("PRAGMA table_info(papers)")
-    columns = [info[1] for info in cursor.fetchall()]
-    if 'full_text_status' not in columns:
-        try:
-            cursor.execute("ALTER TABLE papers ADD COLUMN full_text_status TEXT")
-            st.toast("시스템: DB 업데이트 완료 (full_text_status 컬럼 추가됨)")
-        except:
-            pass # 이미 있으면 패스
-
     # 2. 데일리 브리핑 테이블
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS daily_columns (
@@ -65,7 +60,7 @@ def init_db():
         )
     ''')
     
-    # 3. 블로그 포스트 테이블 (구버전 충돌 방지)
+    # 3. 블로그 포스트 테이블 (테이블 구조 보장)
     try:
         cursor.execute("SELECT target_type FROM blog_posts LIMIT 1")
     except sqlite3.OperationalError:
@@ -82,32 +77,8 @@ def init_db():
         )
     ''')
     
-    # 4. [NEW] 시스템 설정 테이블 (자동화 제어용)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS system_config (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    ''')
-    
     conn.commit()
     conn.close()
-
-# 설정 저장/로드 함수
-def set_config(key, value):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO system_config VALUES (?, ?)", (key, str(value)))
-    conn.commit()
-    conn.close()
-
-def get_config(key):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM system_config WHERE key=?", (key,))
-    res = cur.fetchone()
-    conn.close()
-    return res[0] if res else "False"
 
 def get_papers_by_date(target_date_str):
     conn = sqlite3.connect(DB_NAME)
@@ -434,10 +405,9 @@ init_db()
 st.title("🏥 한의학 논문 AI 큐레이터 Pro")
 st.markdown("---")
 
-# 🚨 수정된 부분: 탭을 5개로 늘리고 변수도 5개를 할당함
-tab_briefing, tab_blog, tab_archive, tab_search, tab_settings = st.tabs(["📝 데일리 브리핑", "✍️ 블로그/수익화", "📚 보관함", "🔎 검색", "⚙️ 자동화 설정"])
+tab_briefing, tab_blog, tab_archive, tab_search = st.tabs(["📝 데일리 브리핑", "✍️ 블로그/수익화", "📚 보관함", "🔎 검색"])
 
-# --- [Tab 1: 데일리 브리핑] ---
+# --- [Tab 1: 데일리 브리핑 & 텔레그램 전송] ---
 with tab_briefing:
     c1, c2 = st.columns([1, 2])
     with c1:
@@ -458,22 +428,45 @@ with tab_briefing:
                 st.rerun()
 
     with c2:
-        st.subheader("📨 공유 및 커스텀")
+        st.subheader("📨 공유 및 전송")
         content = get_daily_column(target_date_str)
         
         if content:
-            st.markdown("##### 📢 추가 코멘트")
-            user_footer = st.text_area("하단 안내문구", height=100)
+            # 1. 텔레그램 전송 기능 (NEW)
+            st.markdown("##### 🚀 텔레그램으로 전송하기")
             
-            final_display_text = content
+            # (옵션) 추가 코멘트
+            user_footer = st.text_area("📢 추가 코멘트 (선택)", height=70, placeholder="예: 금일 진료는 7시까지입니다.")
+            
+            # 최종 전송 텍스트
+            final_msg = content
             if user_footer:
-                final_display_text += "\n\n--------------------------------\n📢 **Editor's Note**\n" + user_footer
+                final_msg += f"\n\n--------------------------------\n📢 **Editor's Note**\n{user_footer}"
+
+            if st.button("✈️ 텔레그램 채널로 즉시 전송", type="primary"):
+                if not telegram_token or not chat_id:
+                    st.error("좌측 사이드바에서 텔레그램 Token과 Chat ID를 입력해주세요.")
+                else:
+                    try:
+                        url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+                        payload = {"chat_id": chat_id, "text": final_msg, "parse_mode": "Markdown"}
+                        res = requests.post(url, json=payload)
+                        if res.status_code == 200:
+                            st.toast("✅ 전송 성공!", icon="🚀")
+                            st.success("텔레그램으로 전송되었습니다.")
+                        else:
+                            st.error(f"전송 실패: {res.text}")
+                    except Exception as e:
+                        st.error(f"에러: {e}")
+
+            st.divider()
             
-            st.code(final_display_text, language='markdown')
+            # 2. 복사 기능
+            st.code(final_msg, language='markdown')
             st.caption("👆 우측 상단 아이콘 클릭 시 전체 복사")
             
             with st.expander("미리보기"):
-                st.markdown(final_display_text)
+                st.markdown(final_msg)
         else:
             st.warning("생성된 브리핑이 없습니다.")
 
@@ -654,44 +647,6 @@ with tab_search:
                 st.session_state.search_res = None
                 time.sleep(1)
                 st.rerun()
-
-# --- [Tab 5: 자동화 설정 (NEW)] ---
-with tab_settings:
-    st.subheader("🤖 자동화 봇 제어판")
-    st.markdown("""
-    여기서 설정을 변경하면, 매일 아침 GitHub Actions 봇이 이 설정을 확인하고 작동합니다.
-    (내 컴퓨터가 꺼져 있어도 돌아갑니다.)
-    """)
-    
-    current_status = get_config("auto_bot_enabled")
-    is_on = True if current_status == "True" else False
-    
-    st.divider()
-    
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.markdown("#### 🚀 자동 브리핑 전송")
-        auto_toggle = st.toggle("매일 아침 자동 실행 켜기", value=is_on)
-        
-        if auto_toggle != is_on:
-            set_config("auto_bot_enabled", str(auto_toggle))
-            st.success(f"설정이 저장되었습니다: {'켜짐' if auto_toggle else '꺼짐'}")
-            time.sleep(1)
-            st.rerun()
-            
-    with col2:
-        st.info(f"""
-        **현재 상태:** {'🟢 작동 중' if auto_toggle else '🔴 정지됨'}
-        
-        **작동 원리:**
-        1. 매일 아침 8시(KST)에 봇이 깨어납니다.
-        2. 이 DB 파일을 열어서 **'켜짐'** 상태인지 확인합니다.
-        3. 켜져 있다면:
-           - 어제 나온 논문을 검색합니다.
-           - Top 7 논문을 심층 분석하여 **이 DB에 저장**합니다.
-           - 데일리 브리핑을 작성해 **텔레그램으로 전송**합니다.
-           - **업데이트된 DB를 자동으로 저장소에 백업**합니다.
-        """)
 
 if __name__ == "__main__":
     init_db()
