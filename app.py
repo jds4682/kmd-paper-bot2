@@ -401,13 +401,17 @@ with tab_blog:
 
 # --- [Tab 3: 보관함 (필터 적용)] ---
 with tab_archive:
+    # 1. DB에서 데이터 가져오기
     df_all = pd.read_sql("SELECT * FROM papers", sqlite3.connect(DB_NAME))
+    
     if df_all.empty:
-        st.info("비어있음")
+        st.info("보관함이 비어있습니다.")
     else:
         st.subheader("🔍 필터링")
+        
+        # 2. 필터 UI
         cats = sorted(df_all['intervention_category'].unique().tolist())
-        sel_cats = st.multiselect("중재법", cats, default=cats)
+        sel_cats = st.multiselect("중재법 선택", cats, default=cats)
         
         if 'archive_body_part' not in st.session_state: st.session_state.archive_body_part = "전체"
         def btn_col(part): return "primary" if st.session_state.archive_body_part == part else "secondary"
@@ -419,6 +423,7 @@ with tab_archive:
                 st.session_state.archive_body_part = part
                 st.rerun()
 
+        # 3. 데이터 필터링
         df_filt = df_all.copy()
         if sel_cats: df_filt = df_filt[df_filt['intervention_category'].isin(sel_cats)]
         if st.session_state.archive_body_part != "전체":
@@ -428,29 +433,36 @@ with tab_archive:
         st.subheader(f"📚 목록 ({len(df_filt)}건)")
         
         if not df_filt.empty:
+            # 삭제 체크박스 및 URL 링크 생성
             df_filt.insert(0, "del", False)
             df_filt["url"] = "https://pubmed.ncbi.nlm.nih.gov/" + df_filt["pmid"]
             
+            # 4. 데이터 에디터 표시 (여기에 'date_published' 추가됨!)
             edited = st.data_editor(
                 df_filt,
                 column_config={
                     "del": st.column_config.CheckboxColumn("삭제", width="small"),
-                    "url": st.column_config.LinkColumn("Link", display_text="🔗"),
+                    "url": st.column_config.LinkColumn("Link", display_text="🔗", width="small"),
+                    "date_published": st.column_config.TextColumn("수집일", width="small"), # [복구됨]
                     "title_kr": st.column_config.TextColumn("제목", width="large"),
                     "target_body_part": st.column_config.TextColumn("부위", width="small"),
                     "intervention_category": st.column_config.TextColumn("중재", width="small"),
+                    "clinical_score": st.column_config.NumberColumn("점수", format="%d점"),
                 },
-                column_order=["del", "url", "clinical_score", "intervention_category", "target_body_part", "title_kr", "summary"],
-                hide_index=True, use_container_width=True
+                # 컬럼 순서 지정 (수집일을 앞쪽으로 배치)
+                column_order=["del", "url", "date_published", "clinical_score", "intervention_category", "target_body_part", "title_kr", "summary"],
+                hide_index=True, 
+                use_container_width=True
             )
             
+            # 5. 삭제 로직
             if st.button("🗑️ 삭제 확인"):
                 to_del = edited[edited["del"]]['pmid'].tolist()
                 if to_del:
                     delete_papers(to_del)
                     st.success("삭제됨 (GitHub 자동 동기화)")
                     st.rerun()
-        else: st.warning("결과 없음")
+        else: st.warning("조건에 맞는 논문이 없습니다.")
 
 # --- [Tab 4: 검색] ---
 with tab_search:
@@ -506,4 +518,5 @@ if __name__ == "__main__":
     if not st.session_state.get('db_synced'):
         db.pull_db()
         st.session_state.db_synced = True
+
 
