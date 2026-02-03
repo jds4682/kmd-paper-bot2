@@ -1,15 +1,16 @@
-name: Daily KMD Briefing
+name: Daily KMD Bot with DB Sync
 
 on:
   schedule:
-    # 매일 아침 8시 (한국시간) 실행
-    # GitHub 서버 시간은 UTC이므로, 한국 8시는 UTC 23시 (전날)
-    - cron: '0 23 * * *' 
-  workflow_dispatch: # 수동 실행 버튼 추가
+    - cron: '0 23 * * *' # 매일 아침 8시 (KST)
+  workflow_dispatch:
 
 jobs:
-  run-bot:
+  run-and-sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 저장소 쓰기 권한 부여
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -20,13 +21,21 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Run Automation Script
+      - name: Run Bot (Analyze & Save DB)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python daily_bot.py
+
+      - name: Commit and Push DB changes
+        run: |
+          git config --global user.name "KMD Bot"
+          git config --global user.email "bot@noreply.github.com"
+          git add kmd_papers_v5_column.db
+          # 변경사항이 있을 때만 커밋
+          git commit -m "🤖 Daily DB Update: Papers added" || exit 0
+          git push
