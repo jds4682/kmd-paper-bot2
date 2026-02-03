@@ -1,8 +1,6 @@
-openai
-biopython
 streamlit
 openai
 biopython
 requests
-
-
+pandas
+PyGithub
