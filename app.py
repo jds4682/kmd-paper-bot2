@@ -11,6 +11,31 @@ from openai import OpenAI
 import time
 import db_handler as db  # [중요] DB 핸들러 임포트
 
+# ===================== [0. 무료 파이썬 분석기 추가] =====================
+def analyze_metadata_free(text, title):
+    """AI 없이 파이썬으로 N수, P값, 태그 등을 추출"""
+    text_lower = text.lower() if text else ""
+    title_lower = title.lower() if title else ""
+    meta = {"n_count": "", "p_value": "", "tags": []}
+
+    # 1. N수 (참여자 수)
+    n_match = re.search(r'\bn\s*=\s*(\d+)', text_lower)
+    if n_match: meta["n_count"] = f"n={n_match.group(1)}"
+
+    # 2. P값 (통계 유의성)
+    if "p<0.05" in text_lower.replace(" ", "") or "p < 0.05" in text_lower:
+        meta["p_value"] = "✅ P<0.05"
+
+    # 3. 자동 태그 (키워드 기반)
+    if "acupotomy" in text_lower or "miniscalpel" in text_lower: meta["tags"].append("#도침")
+    if "pharmacopuncture" in text_lower or "bee venom" in text_lower: meta["tags"].append("#약침")
+    if "chuna" in text_lower or "tuina" in text_lower or "manipulation" in text_lower: meta["tags"].append("#추나")
+    if "thread" in text_lower and "embedding" in text_lower: meta["tags"].append("#매선")
+    if "herbal" in text_lower or "decoction" in text_lower: meta["tags"].append("#한약")
+    
+    # 리스트를 문자열로 변환해서 저장
+    meta["tags_str"] = ", ".join(meta["tags"])
+    return meta
 # ===================== [앱 시작 시 DB 동기화] =====================
 # 앱이 켜질 때 GitHub에서 최신 DB 파일을 받아옵니다.
 if 'db_synced' not in st.session_state:
@@ -39,9 +64,29 @@ Entrez.email = email_address
 DB_NAME = 'kmd_papers_v5_column.db' 
 
 # ===================== [1. DB 관리] =====================
-def init_db():
-    # db_handler에서 처리하므로 여기선 생략 가능하지만, 안전장치로 둠
-    pass
+# ===================== [DB 마이그레이션] =====================
+def migrate_db():
+    """기존 DB에 새로운 컬럼(n_count, tags 등)이 없으면 추가"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # 추가할 컬럼 목록
+    new_columns = [
+        ("n_count", "TEXT"),
+        ("p_value", "TEXT"),
+        ("tags", "TEXT"),
+        ("user_note", "TEXT")
+    ]
+    
+    for col, dtype in new_columns:
+        try:
+            cursor.execute(f"ALTER TABLE papers ADD COLUMN {col} {dtype}")
+            # st.toast(f"🎉 DB 업데이트: {col} 항목 추가됨") # 알림이 너무 많이 뜨면 주석 처리
+        except sqlite3.OperationalError:
+            pass # 이미 있으면 패스
+            
+    conn.commit()
+    conn.close()
 
 def get_papers_by_date(target_date_str):
     conn = sqlite3.connect(DB_NAME)
@@ -443,14 +488,18 @@ with tab_archive:
                 column_config={
                     "del": st.column_config.CheckboxColumn("삭제", width="small"),
                     "url": st.column_config.LinkColumn("Link", display_text="🔗", width="small"),
-                    "date_published": st.column_config.TextColumn("수집일", width="small"), # [복구됨]
+                    "date_published": st.column_config.TextColumn("수집일", width="small"),
                     "title_kr": st.column_config.TextColumn("제목", width="large"),
-                    "target_body_part": st.column_config.TextColumn("부위", width="small"),
-                    "intervention_category": st.column_config.TextColumn("중재", width="small"),
-                    "clinical_score": st.column_config.NumberColumn("점수", format="%d점"),
+                    # 새로 추가된 컬럼 설정
+                    "tags": st.column_config.TextColumn("태그", width="medium"), 
+                    "n_count": st.column_config.TextColumn("N수", width="small"),
+                    "user_note": st.column_config.TextColumn("메모", width="medium"), # 여기서 바로 메모 수정 가능!
                 },
-                # 컬럼 순서 지정 (수집일을 앞쪽으로 배치)
-                column_order=["del", "url", "date_published", "clinical_score", "intervention_category", "target_body_part", "title_kr", "summary"],
+                # 화면에 보여줄 컬럼 순서
+                column_order=[
+                    "del", "url", "clinical_score", "tags", "n_count", # 태그랑 N수를 앞쪽에 배치
+                    "title_kr", "intervention_category", "user_note"
+                ],
                 hide_index=True, 
                 use_container_width=True
             )
@@ -481,6 +530,8 @@ with tab_search:
         edited = st.data_editor(df, column_config={"Sel": st.column_config.CheckboxColumn("선택")}, hide_index=True)
         targets = edited[edited["Sel"]]
         
+        # --- [Tab 4: 검색] 내부의 저장 버튼 부분 수정 ---
+
         if st.button(f"2. {len(targets)}건 분석 및 저장"):
             if not openai_api_key: st.error("Key 없음")
             else:
@@ -488,27 +539,49 @@ with tab_search:
                 bar = st.progress(0)
                 full_list = [p for p in st.session_state.search_res if p['pmid'] in targets['pmid'].tolist()]
                 
-                # DB 테이블 생성 체크
-                cur.execute('''CREATE TABLE IF NOT EXISTS papers (pmid TEXT PRIMARY KEY, date_published TEXT, title_kr TEXT, intervention_category TEXT, target_body_part TEXT, specific_point TEXT, study_design TEXT, clinical_score INTEGER, summary TEXT, original_title TEXT, abstract TEXT, icd_code TEXT, full_text_status TEXT)''')
+                # 테이블 생성 (혹시 없을 경우를 대비해 컬럼 다 넣어서 정의)
+                cur.execute('''CREATE TABLE IF NOT EXISTS papers (
+                    pmid TEXT PRIMARY KEY, date_published TEXT, title_kr TEXT, 
+                    intervention_category TEXT, target_body_part TEXT, specific_point TEXT, 
+                    study_design TEXT, clinical_score INTEGER, summary TEXT, 
+                    original_title TEXT, abstract TEXT, icd_code TEXT, full_text_status TEXT,
+                    n_count TEXT, p_value TEXT, tags TEXT, user_note TEXT
+                )''')
                 
                 for i, p in enumerate(full_list):
                     bar.progress((i+1)/len(full_list))
+                    
+                    # 1. 유료 분석 (OpenAI)
                     res = analyze_paper_strict(p, openai_api_key)
+                    
+                    # 2. 무료 분석 (Python) - 추가된 부분!
+                    meta = analyze_metadata_free(p['abstract'], p['title'])
+                    
                     if "error" not in res:
-                        cur.execute('INSERT OR REPLACE INTO papers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', (
+                        # INSERT 문에 새로운 컬럼 4개(n_count, p_value, tags, user_note) 추가
+                        cur.execute('''
+                            INSERT OR REPLACE INTO papers VALUES 
+                            (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?) 
+                        ''', (
                             p['pmid'], datetime.now().strftime('%Y-%m-%d'),
                             res.get('korean_title'), res.get('intervention_category'),
                             res.get('target_body_part'), res.get('specific_point'),
                             res.get('study_design'), res.get('clinical_score'),
                             res.get('summary'), p['title'], p['abstract'], 
-                            res.get('icd_code'), "Abstract Saved"
+                            res.get('icd_code'), "Abstract Saved",
+                            
+                            # 새로 추가된 데이터 저장
+                            meta['n_count'], 
+                            meta['p_value'], 
+                            meta['tags_str'], 
+                            "" # user_note는 처음에 빈칸
                         ))
                         conn.commit()
-                conn.close()
-                # [중요] 저장 완료 후 GitHub 업로드
-                db.push_db()
                 
-                st.success("분석 및 저장 완료! (GitHub 동기화 됨)")
+                conn.close()
+                db.push_db() # GitHub 동기화
+                
+                st.success(f"분석 완료! (태그, N수 자동 추출됨)")
                 st.session_state.search_res = None
                 time.sleep(1)
                 st.rerun()
@@ -518,5 +591,7 @@ if __name__ == "__main__":
     if not st.session_state.get('db_synced'):
         db.pull_db()
         st.session_state.db_synced = True
+    migrate_db() # <--- 여기 추가! (앱 켜질 때 DB 구조 최신화)
+
 
 
