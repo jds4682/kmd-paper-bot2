@@ -1,3 +1,7 @@
 openai
 biopython
+streamlit
+openai
+biopython
+requests
 requests
