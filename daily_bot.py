@@ -6,7 +6,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from Bio import Entrez
 from openai import OpenAI
-import re  # re 모듈 추가 (누락 주의)
+import re
+import time  # [중요] 시간 지연을 위해 필수
 
 # ===================== [환경 변수] =====================
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -15,24 +16,24 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 DB_NAME = 'kmd_papers_v5_column.db' 
 
-if not TELEGRAM_TOKEN or not CHAT_ID:
-    print("❌ 설정 오류: Secrets를 확인하세요.")
+# 키 확인 (보안상 앞 5자리만 출력)
+print(f"DEBUG: API Key Loaded? {'Yes' if OPENAI_API_KEY else 'No'}")
+if OPENAI_API_KEY:
+    print(f"DEBUG: Key starts with: {OPENAI_API_KEY[:5]}...")
+
+if not TELEGRAM_TOKEN or not CHAT_ID or not OPENAI_API_KEY:
+    print("❌ 설정 오류: Secrets(API KEY, Telegram Info)를 확인하세요.")
     exit(1)
 
 Entrez.email = EMAIL_ADDRESS
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ===================== [DB 관련 함수] =====================
-# 설정 확인 함수는 이제 필요 없지만 에러 방지 위해 남겨둠
-def get_config_status():
-    return True 
-
 def save_paper_to_db(data):
-    """분석된 논문을 DB에 저장 (토큰 절약 핵심)"""
+    """분석된 논문을 DB에 저장"""
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     try:
-        # DB 테이블이 없는 경우를 대비해 생성문 추가 (안전장치)
         cur.execute('''CREATE TABLE IF NOT EXISTS papers (
             pmid TEXT PRIMARY KEY, date_published TEXT, title_kr TEXT, intervention_category TEXT, 
             target_body_part TEXT, specific_point TEXT, study_design TEXT, clinical_score INTEGER,
@@ -41,7 +42,7 @@ def save_paper_to_db(data):
         
         cur.execute('INSERT OR REPLACE INTO papers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', (
             data['pmid'], datetime.now().strftime('%Y-%m-%d'),
-            data['title_kr'], "자동수집", # 카테고리는 자동
+            data['title_kr'], "자동수집", 
             data.get('target_body_part', '기타'), data.get('specific_point', ''),
             data.get('study_design', ''), data.get('clinical_score', 0),
             data.get('summary', ''), data['original_title'], data['abstract'], 
@@ -57,6 +58,8 @@ def save_paper_to_db(data):
 # ===================== [분석 로직] =====================
 def fetch_pmc_fulltext(pmid):
     try:
+        # [Rate Limit 방지] Entrez도 너무 빠르면 차단당함
+        time.sleep(1) 
         link = Entrez.elink(dbfrom="pubmed", db="pmc", id=pmid)
         if not link or not link[0]['LinkSetDb']: return None, "Abstract Only"
         pmc_id = link[0]['LinkSetDb'][0]['Link'][0]['Id']
@@ -78,17 +81,21 @@ def analyze_paper_bot(title, abstract, pmid):
     4. study_design: RCT, SR, etc.
     
     Title: {title}
-    Text: {content[:10000]}
+    Text: {content[:8000]} 
     
     Output JSON format only: {{ "korean_title": "...", "clinical_score": 8, "summary": "...", "study_design": "...", "target_body_part": "...", "specific_point": "..." }}
     """
     try:
+        # [핵심 수정] OpenAI 호출 전 2초 대기 (서버 과부하 방지)
+        print("⏳ AI 분석 대기 중...")
+        time.sleep(2) 
+        
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0
         )
-        # JSON 파싱 강화
+        
         raw_text = res.choices[0].message.content.strip()
         match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if match:
@@ -101,23 +108,25 @@ def analyze_paper_bot(title, abstract, pmid):
         else:
             return None
     except Exception as e:
-        print(f"분석 에러: {e}")
+        # [핵심 수정] 에러 메시지를 더 자세히 출력
+        print(f"🚨 OpenAI API 에러 발생: {type(e).__name__}")
+        print(f"내용: {e}")
         return None
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+    try:
+        res = requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+        if res.status_code != 200:
+            print(f"텔레그램 전송 실패: {res.text}")
+    except Exception as e:
+        print(f"텔레그램 연결 에러: {e}")
 
 # ===================== [메인 실행] =====================
 if __name__ == "__main__":
     print("🤖 봇 기동...")
+    print("🟢 자동화 강제 실행 모드")
     
-    # [수정됨] 설정 체크 로직을 제거하고 무조건 실행
-    # if not get_config_status(): ... (삭제)
-    
-    print("🟢 자동화 강제 실행 모드 (설정 체크 건너뜀)")
-    
-    # 2. 논문 검색 (최근 2일 - 주말 고려)
     today = datetime.now()
     yesterday = (today - timedelta(days=1)).strftime("%Y/%m/%d")
     two_days_ago = (today - timedelta(days=2)).strftime("%Y/%m/%d")
@@ -129,17 +138,16 @@ if __name__ == "__main__":
     try:
         handle = Entrez.esearch(db="pubmed", term=term, mindate=two_days_ago, maxdate=yesterday, datetype="pdat", retmax=7)
         pmids = Entrez.read(handle)["IdList"]
-    except: pmids = []
+    except Exception as e:
+        print(f"검색 에러: {e}")
+        pmids = []
     
     if not pmids:
-        msg = f"📅 {yesterday}\n새로운 임상 논문이 없습니다."
-        print(msg)
-        send_telegram(msg)
+        print("논문 없음")
         exit(0)
         
     print(f"📄 검색된 논문 {len(pmids)}건 분석 시작...")
 
-    # 3. 분석 및 DB 저장
     analyzed_list = []
     for pmid in pmids:
         try:
@@ -148,22 +156,23 @@ if __name__ == "__main__":
             title = art['ArticleTitle']
             abst = art['Abstract']['AbstractText'][0] if 'Abstract' in art else ""
             
-            # AI 분석
             result = analyze_paper_bot(title, abst, pmid)
             if result:
-                save_paper_to_db(result) # DB에 영구 저장!
+                save_paper_to_db(result)
                 analyzed_list.append(result)
+            else:
+                print(f"❌ {pmid} 분석 실패 (결과 없음)")
+                
         except Exception as e:
             print(f"Skip {pmid}: {e}")
             
-    # 4. 브리핑 생성 및 전송
     if analyzed_list:
         analyzed_list.sort(key=lambda x: x.get('clinical_score', 0), reverse=True)
         
         briefing = f"📅 **{yesterday} 한의 임상 브리핑**\n\n"
-        for i, paper in enumerate(analyzed_list[:5]): # Top 5만 전송
+        for i, paper in enumerate(analyzed_list[:5]):
             briefing += f"{'🥇' if i==0 else '🥈' if i==1 else '📰'} **{paper['korean_title']}**\n"
-            briefing += f"(⭐{paper.get('clinical_score',0)} / {paper.get('study_design','')})\n"
+            briefing += f"(⭐{paper.get('clinical_score',0)})\n"
             briefing += f"{paper.get('summary','')}\n"
             briefing += f"🔗 https://pubmed.ncbi.nlm.nih.gov/{paper['pmid']}\n\n"
             
