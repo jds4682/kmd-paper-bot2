@@ -12,6 +12,8 @@ import time
 
 # ===================== [설정 및 초기화] =====================
 st.set_page_config(page_title="한의학 논문 AI 큐레이터 Pro", layout="wide", page_icon="🏥")
+# 앱 시작하자마자 최신 DB 다운로드
+db.pull_db()
 
 with st.sidebar:
     st.header("⚙️ 기본 설정")
@@ -550,3 +552,4 @@ with tab_search:
 
 if __name__ == "__main__":
     init_db()
+
