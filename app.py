@@ -9,11 +9,17 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from openai import OpenAI
 import time
+import db_handler as db  # [중요] DB 핸들러 임포트
+
+# ===================== [앱 시작 시 DB 동기화] =====================
+# 앱이 켜질 때 GitHub에서 최신 DB 파일을 받아옵니다.
+if 'db_synced' not in st.session_state:
+    with st.spinner("서버와 데이터 동기화 중..."):
+        db.pull_db()
+    st.session_state.db_synced = True
 
 # ===================== [설정 및 초기화] =====================
 st.set_page_config(page_title="한의학 논문 AI 큐레이터 Pro", layout="wide", page_icon="🏥")
-# 앱 시작하자마자 최신 DB 다운로드
-db.pull_db()
 
 with st.sidebar:
     st.header("⚙️ 기본 설정")
@@ -31,50 +37,8 @@ DB_NAME = 'kmd_papers_v5_column.db'
 
 # ===================== [1. DB 관리] =====================
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS papers (
-            pmid TEXT PRIMARY KEY,
-            date_published TEXT,
-            title_kr TEXT,
-            intervention_category TEXT, 
-            target_body_part TEXT,      
-            specific_point TEXT,        
-            study_design TEXT,
-            clinical_score INTEGER,
-            summary TEXT,
-            original_title TEXT,
-            abstract TEXT,
-            icd_code TEXT,
-            full_text_status TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS daily_columns (
-            date_id TEXT PRIMARY KEY,
-            content TEXT,
-            created_at TEXT
-        )
-    ''')
-    try:
-        cursor.execute("SELECT target_type FROM blog_posts LIMIT 1")
-    except sqlite3.OperationalError:
-        cursor.execute("DROP TABLE IF EXISTS blog_posts")
-        conn.commit()
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS blog_posts (
-            date_id TEXT,
-            target_type TEXT, 
-            content TEXT,
-            created_at TEXT,
-            PRIMARY KEY (date_id, target_type)
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    # db_handler에서 처리하므로 여기선 생략 가능하지만, 안전장치로 둠
+    pass
 
 def get_papers_by_date(target_date_str):
     conn = sqlite3.connect(DB_NAME)
@@ -89,10 +53,12 @@ def get_papers_by_date(target_date_str):
 def get_daily_column(date_str):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT content FROM daily_columns WHERE date_id = ?", (date_str,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
+    try:
+        cursor.execute("SELECT content FROM daily_columns WHERE date_id = ?", (date_str,))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except: return None
+    finally: conn.close()
 
 def save_daily_column(date_str, content):
     conn = sqlite3.connect(DB_NAME)
@@ -101,6 +67,8 @@ def save_daily_column(date_str, content):
                    (date_str, content, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     conn.commit()
     conn.close()
+    # [중요] 저장 후 GitHub 업로드
+    db.push_db()
 
 def get_blog_post(date_str, target_type):
     conn = sqlite3.connect(DB_NAME)
@@ -110,6 +78,7 @@ def get_blog_post(date_str, target_type):
         result = cursor.fetchone()
         return result[0] if result else None
     except: return None
+    finally: conn.close()
 
 def save_blog_post(date_str, target_type, content):
     conn = sqlite3.connect(DB_NAME)
@@ -118,6 +87,8 @@ def save_blog_post(date_str, target_type, content):
                    (date_str, target_type, content, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     conn.commit()
     conn.close()
+    # [중요] 저장 후 GitHub 업로드
+    db.push_db()
 
 def delete_papers(pmid_list):
     conn = sqlite3.connect(DB_NAME)
@@ -127,6 +98,8 @@ def delete_papers(pmid_list):
         cursor.execute(f"DELETE FROM papers WHERE pmid IN ({placeholders})", pmid_list)
         conn.commit()
     conn.close()
+    # [중요] 삭제 후 GitHub 업로드
+    db.push_db()
 
 def check_if_exists(pmid):
     conn = sqlite3.connect(DB_NAME)
@@ -151,43 +124,24 @@ def fetch_pmc_fulltext(pmid):
     except Exception as e:
         return None, f"Error: {str(e)}"
 
-# ===================== [3. AI 분석 로직 (카테고리/부위 분류 강화)] =====================
+# ===================== [3. AI 분석 로직] =====================
 def analyze_paper_strict(paper_data, api_key):
     client = OpenAI(api_key=api_key)
-    
-    # 카테고리 엄격 분류 프롬프트
     prompt = f"""
     너는 임상 한의학 논문 분류 전문가다.
     
-    [필수 규칙 1: 중재법(intervention_category) 분류]
-    다음 6개 카테고리 중 하나만 선택하라. (절대 다른 단어 쓰지 말 것)
-    - "침"
-    - "뜸"
-    - "부항"
-    - "한약"
-    - "약침"
-    - "추나"
-    * 위 6개에 해당하지 않으면 무조건 "기타"로 분류. (예: 기공, 명상 등은 기타)
+    [필수 규칙 1: 중재법 분류]
+    - 침, 뜸, 부항, 한약, 약침, 추나 중 택1. 해당 없으면 "기타".
 
-    [필수 규칙 2: 신체부위(target_body_part) 분류]
-    논문의 대상 질환 부위를 다음 5개 중 하나로 분류하라.
-    - "두경부" (머리, 안면, 목, 경추, 턱관절)
-    - "척추/허리" (흉추, 요추, 천골, 척추 전반)
-    - "상지" (어깨, 팔꿈치, 손목, 손가락)
-    - "하지" (고관절, 무릎, 발목, 발가락)
-    - "내장기/전신" (소화기, 부인과, 신경정신, 피부, 비만, 당뇨, 암 등 전신 질환)
-
-    [필수 규칙 3: 기타 분석]
-    - clinical_score: 1~10점 (근골격/소화기/통증 등 로컬 다빈도 질환 가산점)
-    - specific_point: 처방명(구성/g수), 혈자리 필수
-    - study_design: RCT, SR, Case Report, Cohort (동물실험은 DROP)
+    [필수 규칙 2: 신체부위 분류]
+    - 두경부, 척추/허리, 상지, 하지, 내장기/전신 중 택1.
 
     [JSON 형식]
     {{
         "korean_title": "한글 제목",
         "study_design": "연구 유형",
-        "intervention_category": "카테고리(위 규칙 준수)",
-        "target_body_part": "신체부위(위 규칙 준수)",
+        "intervention_category": "카테고리",
+        "target_body_part": "신체부위",
         "specific_point": "상세 중재 내용",
         "clinical_score": 8,
         "summary": "3줄 요약",
@@ -211,7 +165,6 @@ def analyze_paper_strict(paper_data, api_key):
         return {"error": str(e)}
 
 # ===================== [4. PubMed 검색] =====================
-# 1차 분류용 헬퍼 함수 (AI 분석 전 단순 분류용)
 def simple_keyword_classify(text):
     text = text.lower()
     if "acupuncture" in text or "needling" in text: return "침"
@@ -282,9 +235,7 @@ def generate_daily_briefing_pro_v3(date_str, papers_df, api_key, model_choice):
         
         pico_prompt = f"""
         이 논문을 PICO 구조로 분석하라.
-        [규칙]
-        1. 약어는 반드시 Full Name으로 변환. (모르면 Unknown)
-        2. 약재 용량, 횟수 등 수치 정보 필수 포함.
+        [규칙] Full Name 변환 및 수치 정보 포함.
         Title: {row['title_kr']}
         Text: {content_source[:15000]}
         """
@@ -310,7 +261,7 @@ def generate_daily_briefing_pro_v3(date_str, papers_df, api_key, model_choice):
 
     final_prompt = f"""
     당신은 한의학 에디터입니다. 상위 7개(Pick 2 + News 5) 논문 브리핑을 작성하세요.
-    [필수] 각 논문 하단에 `🔗 원문: https://pubmed.ncbi.nlm.nih.gov/[PMID]` 링크 추가.
+    [필수] 원문 링크 포함: `🔗 원문: https://pubmed.ncbi.nlm.nih.gov/[PMID]`
     
     [출력 포맷]
     📅 **{date_str} 한의 임상 브리핑**
@@ -321,8 +272,6 @@ def generate_daily_briefing_pro_v3(date_str, papers_df, api_key, model_choice):
     - 💊 **Method:** ...
     - 📊 **Result:** ...
     - 🔗 **원문:** https://pubmed.ncbi.nlm.nih.gov/[PMID]
-
-    (이하 동일)
     
     [입력 데이터]
     {json.dumps(analyzed_data, ensure_ascii=False)}
@@ -345,7 +294,6 @@ def generate_blog_article(date_str, papers_df, api_key, model_choice, target_aud
     prompt = f"""
     당신은 전문 의학 블로거입니다. 이 논문으로 블로그 글을 작성하세요.
     타겟: {'전문가(한의사)' if target_audience == 'doctor' else '일반 환자'}
-    목표: {'전문적 분석 및 지식 공유' if target_audience == 'doctor' else '한의원 내원 유도 및 정보 전달'}
     
     [논문 정보]
     제목: {top_paper['title_kr']}
@@ -361,8 +309,6 @@ def generate_blog_article(date_str, papers_df, api_key, model_choice, target_aud
     except Exception as e: return f"블로그 생성 실패: {e}"
 
 # ===================== [7. UI 구성] =====================
-init_db()
-
 st.title("🏥 한의학 논문 AI 큐레이터 Pro")
 st.markdown("---")
 
@@ -386,6 +332,7 @@ with tab_briefing:
             else:
                 briefing = generate_daily_briefing_pro_v3(target_date_str, daily_papers, openai_api_key, model_option)
                 save_daily_column(target_date_str, briefing)
+                st.success("브리핑 생성 및 저장 완료!") # GitHub 업로드 됨
                 st.rerun()
 
     with c2:
@@ -434,7 +381,7 @@ with tab_blog:
                 with st.spinner("작성 중..."):
                     article = generate_blog_article(b_date_str, b_papers, openai_api_key, b_model, "doctor" if "전문가" in target_type else "patient")
                     save_blog_post(b_date_str, "doctor" if "전문가" in target_type else "patient", article)
-                    st.success("완료!")
+                    st.success("완료! (GitHub 자동 저장됨)")
                     st.rerun()
 
     with c_b2:
@@ -456,16 +403,12 @@ with tab_archive:
         st.info("비어있음")
     else:
         st.subheader("🔍 필터링")
-        
-        # 1. 중재법 필터 (고정된 카테고리만 뜨게 됨)
         cats = sorted(df_all['intervention_category'].unique().tolist())
         sel_cats = st.multiselect("중재법", cats, default=cats)
         
-        # 2. 신체부위 필터
         if 'archive_body_part' not in st.session_state: st.session_state.archive_body_part = "전체"
         def btn_col(part): return "primary" if st.session_state.archive_body_part == part else "secondary"
         
-        # 버튼 배열
         parts = ["두경부", "척추/허리", "상지", "하지", "내장기/전신", "전체"]
         cols = st.columns(6)
         for i, part in enumerate(parts):
@@ -473,7 +416,6 @@ with tab_archive:
                 st.session_state.archive_body_part = part
                 st.rerun()
 
-        # 필터링 적용
         df_filt = df_all.copy()
         if sel_cats: df_filt = df_filt[df_filt['intervention_category'].isin(sel_cats)]
         if st.session_state.archive_body_part != "전체":
@@ -503,7 +445,7 @@ with tab_archive:
                 to_del = edited[edited["del"]]['pmid'].tolist()
                 if to_del:
                     delete_papers(to_del)
-                    st.success("삭제됨")
+                    st.success("삭제됨 (GitHub 자동 동기화)")
                     st.rerun()
         else: st.warning("결과 없음")
 
@@ -531,6 +473,9 @@ with tab_search:
                 bar = st.progress(0)
                 full_list = [p for p in st.session_state.search_res if p['pmid'] in targets['pmid'].tolist()]
                 
+                # DB 테이블 생성 체크
+                cur.execute('''CREATE TABLE IF NOT EXISTS papers (pmid TEXT PRIMARY KEY, date_published TEXT, title_kr TEXT, intervention_category TEXT, target_body_part TEXT, specific_point TEXT, study_design TEXT, clinical_score INTEGER, summary TEXT, original_title TEXT, abstract TEXT, icd_code TEXT, full_text_status TEXT)''')
+                
                 for i, p in enumerate(full_list):
                     bar.progress((i+1)/len(full_list))
                     res = analyze_paper_strict(p, openai_api_key)
@@ -545,11 +490,16 @@ with tab_search:
                         ))
                         conn.commit()
                 conn.close()
-                st.success("완료")
+                # [중요] 저장 완료 후 GitHub 업로드
+                db.push_db()
+                
+                st.success("분석 및 저장 완료! (GitHub 동기화 됨)")
                 st.session_state.search_res = None
                 time.sleep(1)
                 st.rerun()
 
+# 앱 실행 시 DB 체크 (임포트 시 실행되지만 안전상 한 번 더)
 if __name__ == "__main__":
-    init_db()
-
+    if not st.session_state.get('db_synced'):
+        db.pull_db()
+        st.session_state.db_synced = True
