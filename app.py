@@ -434,7 +434,8 @@ init_db()
 st.title("🏥 한의학 논문 AI 큐레이터 Pro")
 st.markdown("---")
 
-tab_briefing, tab_blog, tab_archive, tab_search = st.tabs(["📝 데일리 브리핑", "✍️ 블로그/수익화", "📚 보관함", "🔎 검색"])
+# 🚨 수정된 부분: 탭을 5개로 늘리고 변수도 5개를 할당함
+tab_briefing, tab_blog, tab_archive, tab_search, tab_settings = st.tabs(["📝 데일리 브리핑", "✍️ 블로그/수익화", "📚 보관함", "🔎 검색", "⚙️ 자동화 설정"])
 
 # --- [Tab 1: 데일리 브리핑] ---
 with tab_briefing:
@@ -611,7 +612,6 @@ with tab_search:
     with col1: s_date = st.date_input("시작", value=datetime.now()-timedelta(days=2))
     with col2: e_date = st.date_input("종료", value=datetime.now())
     
-    # [수정] max_results 슬라이더 복구 및 명확한 위치 배치
     max_results = st.select_slider("검색할 최대 논문 수", options=[10, 30, 50, 100, 300], value=50)
 
     if 'search_res' not in st.session_state: st.session_state.search_res = None
@@ -628,7 +628,6 @@ with tab_search:
         edited_res = st.data_editor(df_res, column_config={"Sel": st.column_config.CheckboxColumn("선택")}, hide_index=True)
         targets = edited_res[edited_res["Sel"]]
         
-        # [수정] 버튼 이름 변경
         if st.button(f"🚀 2. 선택한 {len(targets)}건 AI 분석 및 저장"):
             if not openai_api_key: st.error("Key Missing")
             else:
@@ -655,8 +654,7 @@ with tab_search:
                 st.session_state.search_res = None
                 time.sleep(1)
                 st.rerun()
-                
-                
+
 # --- [Tab 5: 자동화 설정 (NEW)] ---
 with tab_settings:
     st.subheader("🤖 자동화 봇 제어판")
@@ -694,7 +692,6 @@ with tab_settings:
            - 데일리 브리핑을 작성해 **텔레그램으로 전송**합니다.
            - **업데이트된 DB를 자동으로 저장소에 백업**합니다.
         """)
-        
-# (나머지 메인 실행 코드)
+
 if __name__ == "__main__":
-    init_db() # 실행 시 DB 초기화/업데이트
+    init_db()
