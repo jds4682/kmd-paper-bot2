@@ -11,14 +11,13 @@ if 'db_synced' not in st.session_state:
             db.pull_db()
         st.session_state.db_synced = True
     except Exception as e:
-        # 에러 발생 시 경고만 띄우고 진행
         pass
 
 # ===================== [설정] =====================
 st.set_page_config(page_title="한의학 논문 AI 큐레이터", layout="wide", page_icon="🏥")
 DB_NAME = 'kmd_papers_v5_column.db'
 
-# 관리자 로그인 정보 (하드코딩)
+# 관리자 로그인 정보
 ADMIN_ID = "admin"
 ADMIN_PW = "wkdtjrdn1@"
 
@@ -30,6 +29,39 @@ st.markdown("""
     .reply-box {background-color: #e8eef9; padding: 10px; border-radius: 10px; margin-left: 30px; margin-bottom: 10px; border-left: 3px solid #4e8cff;}
     </style>
 """, unsafe_allow_html=True)
+
+# ===================== [DB 구조 보정 (핵심 수정 부분)] =====================
+def init_user_db():
+    """테이블이 없으면 강제로 생성하는 함수"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    
+    # 1. 댓글 테이블 생성
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_id TEXT,
+            target_type TEXT, 
+            author TEXT,
+            content TEXT,
+            parent_id INTEGER,
+            created_at TEXT
+        )
+    ''')
+    
+    # 2. 게시판 테이블 생성
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS community_board (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            content TEXT,
+            author TEXT,
+            created_at TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
 
 # ===================== [DB 조회/저장 함수] =====================
 def get_daily_briefing(date_str):
@@ -64,6 +96,7 @@ def get_papers():
 def add_comment(target_id, target_type, author, content, parent_id=None):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
+    # 테이블이 없을 경우를 대비해 여기서도 한 번 더 체크해도 좋음
     cur.execute("INSERT INTO comments (target_id, target_type, author, content, parent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (target_id, target_type, author, content, parent_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     conn.commit()
@@ -74,7 +107,8 @@ def get_comments(target_id, target_type):
     conn = sqlite3.connect(DB_NAME)
     try:
         df = pd.read_sql("SELECT * FROM comments WHERE target_id=? AND target_type=? ORDER BY created_at ASC", conn, params=(target_id, target_type))
-    except: df = pd.DataFrame()
+    except: 
+        df = pd.DataFrame()
     conn.close()
     return df
 
@@ -92,8 +126,6 @@ def sidebar_admin_login():
     """사이드바 관리자 로그인 창"""
     with st.sidebar:
         st.header("🔧 설정")
-        
-        # 세션 상태 초기화
         if 'is_admin' not in st.session_state:
             st.session_state.is_admin = False
 
@@ -117,7 +149,6 @@ def sidebar_admin_login():
 def comment_section(target_id, target_type):
     st.subheader("💬 의견 나누기")
     
-    # 1. 댓글 작성 폼 (누구나 가능)
     with st.form(f"c_form_{target_id}"):
         c1, c2 = st.columns([1, 4])
         author = c1.text_input("닉네임", placeholder="예: 한의사 김")
@@ -129,21 +160,17 @@ def comment_section(target_id, target_type):
             else:
                 st.warning("닉네임과 내용을 모두 입력해주세요.")
 
-    # 2. 댓글 목록 표시
     comments = get_comments(target_id, target_type)
     if not comments.empty:
         parents = comments[comments['parent_id'].isnull()]
         for _, p in parents.iterrows():
-            # 부모 댓글
             st.markdown(f"<div class='comment-box'><b>{p['author']}</b> <span style='color:grey;font-size:0.8em'>({p['created_at']})</span><br>{p['content']}</div>", unsafe_allow_html=True)
             
-            # [관리자 전용] 삭제 버튼
             if st.session_state.is_admin:
                 if st.button("🗑️ 삭제", key=f"del_{p['id']}"):
                     delete_item('comments', p['id'])
                     st.rerun()
 
-            # 대댓글 작성 (Expander)
             with st.expander("↳ 답글 달기"):
                 with st.form(f"r_form_{p['id']}"):
                     r_auth = st.text_input("닉네임", key=f"ra_{p['id']}")
@@ -153,11 +180,9 @@ def comment_section(target_id, target_type):
                             add_comment(target_id, target_type, r_auth, r_cont, p['id'])
                             st.rerun()
             
-            # 자식 댓글(대댓글)
             children = comments[comments['parent_id'] == p['id']]
             for _, c in children.iterrows():
                 st.markdown(f"<div class='reply-box'><b>↳ {c['author']}</b> <span style='color:grey;font-size:0.8em'>({c['created_at']})</span><br>{c['content']}</div>", unsafe_allow_html=True)
-                # [관리자 전용] 대댓글 삭제
                 if st.session_state.is_admin:
                     if st.button("🗑️ 삭제", key=f"del_{c['id']}"):
                         delete_item('comments', c['id'])
@@ -165,7 +190,10 @@ def comment_section(target_id, target_type):
 
 # ===================== [메인 페이지] =====================
 def main():
-    # 관리자 로그인 처리
+    # 1. 앱 시작 시 테이블 생성 (누락 방지)
+    init_user_db()
+    
+    # 2. 관리자 로그인 처리
     sidebar_admin_login()
     
     st.title("🏥 한의학 논문 AI 큐레이터")
@@ -206,56 +234,38 @@ def main():
         df = get_papers()
         
         if not df.empty:
-            # === 필터링 UI ===
             with st.expander("🔎 검색 및 필터 설정", expanded=True):
                 c1, c2, c3 = st.columns(3)
-                
-                # 1. 텍스트 검색
                 search_txt = c1.text_input("제목/내용 검색")
-                
-                # 2. 날짜 필터 (전체 기간 자동 설정)
                 try:
                     min_date = pd.to_datetime(df['date_published']).min().date()
                     max_date = pd.to_datetime(df['date_published']).max().date()
                 except:
                     min_date, max_date = datetime.now().date(), datetime.now().date()
-                    
                 date_range = c2.date_input("연구 기간", [min_date, max_date])
                 
-                # 3. 연구 설계(Study Design) 필터
                 all_designs = sorted(df['study_design'].astype(str).unique().tolist())
                 sel_designs = c3.multiselect("연구 설계 (SR, RCT 등)", all_designs)
                 
-                # 4. 중재법 필터
                 all_cats = sorted(df['intervention_category'].astype(str).unique().tolist())
                 sel_cats = st.multiselect("중재법 (침, 한약 등)", all_cats)
 
-            # === 데이터 필터링 로직 ===
             df_filt = df.copy()
-            
-            # 검색어
             if search_txt:
                 df_filt = df_filt[df_filt['title_kr'].str.contains(search_txt, case=False) | 
                                   df_filt['summary'].str.contains(search_txt, case=False)]
-            
-            # 날짜
             if len(date_range) == 2:
                 s_d, e_d = date_range
                 df_filt['date_published'] = pd.to_datetime(df_filt['date_published']).dt.date
                 df_filt = df_filt[(df_filt['date_published'] >= s_d) & (df_filt['date_published'] <= e_d)]
-
-            # 연구 설계
             if sel_designs:
                 df_filt = df_filt[df_filt['study_design'].isin(sel_designs)]
-                
-            # 중재법
             if sel_cats:
                 df_filt = df_filt[df_filt['intervention_category'].isin(sel_cats)]
 
             st.markdown(f"**검색 결과:** 총 {len(df_filt)}건")
             st.divider()
 
-            # === 결과 표시 ===
             for _, row in df_filt.iterrows():
                 with st.expander(f"[{row['study_design']}] {row['title_kr']} ({row['intervention_category']})"):
                     st.markdown(f"**임상점수:** ⭐{row['clinical_score']} | **발행일:** {row['date_published']}")
@@ -270,7 +280,6 @@ def main():
         st.subheader("🗣️ 자유게시판")
         st.caption("한의학 관련 자유로운 의견을 남겨주세요. (로그인 불필요)")
         
-        # 글쓰기 폼
         with st.expander("📝 새 글 쓰기"):
             with st.form("board_form"):
                 b_auth = st.text_input("작성자 (닉네임)")
@@ -288,7 +297,6 @@ def main():
                     else:
                         st.warning("모든 항목을 입력해주세요.")
         
-        # 게시글 목록
         conn = sqlite3.connect(DB_NAME)
         try:
             bdf = pd.read_sql("SELECT * FROM community_board ORDER BY created_at DESC", conn)
@@ -303,7 +311,6 @@ def main():
                     st.caption(f"작성자: {row['author']} | {row['created_at']}")
                     st.text(row['content'])
                 with c2:
-                    # [관리자 전용] 삭제 버튼
                     if st.session_state.is_admin:
                         if st.button("🗑️", key=f"bd_{row['id']}", help="게시글 삭제"):
                             delete_item('community_board', row['id'])
