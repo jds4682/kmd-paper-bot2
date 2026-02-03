@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from Bio import Entrez
 from openai import OpenAI
+import re  # re 모듈 추가 (누락 주의)
 
 # ===================== [환경 변수] =====================
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -22,23 +23,22 @@ Entrez.email = EMAIL_ADDRESS
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ===================== [DB 관련 함수] =====================
+# 설정 확인 함수는 이제 필요 없지만 에러 방지 위해 남겨둠
 def get_config_status():
-    """Streamlit에서 설정한 자동화 ON/OFF 값을 읽어옴"""
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM system_config WHERE key='auto_bot_enabled'")
-        res = cur.fetchone()
-        conn.close()
-        return res[0] == "True" if res else False
-    except:
-        return False # 테이블이 없거나 에러나면 안 돌림
+    return True 
 
 def save_paper_to_db(data):
     """분석된 논문을 DB에 저장 (토큰 절약 핵심)"""
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     try:
+        # DB 테이블이 없는 경우를 대비해 생성문 추가 (안전장치)
+        cur.execute('''CREATE TABLE IF NOT EXISTS papers (
+            pmid TEXT PRIMARY KEY, date_published TEXT, title_kr TEXT, intervention_category TEXT, 
+            target_body_part TEXT, specific_point TEXT, study_design TEXT, clinical_score INTEGER,
+            summary TEXT, original_title TEXT, abstract TEXT, icd_code TEXT, full_text_status TEXT
+        )''')
+        
         cur.execute('INSERT OR REPLACE INTO papers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', (
             data['pmid'], datetime.now().strftime('%Y-%m-%d'),
             data['title_kr'], "자동수집", # 카테고리는 자동
@@ -54,7 +54,7 @@ def save_paper_to_db(data):
     finally:
         conn.close()
 
-# ===================== [분석 로직 (app.py와 동일)] =====================
+# ===================== [분석 로직] =====================
 def fetch_pmc_fulltext(pmid):
     try:
         link = Entrez.elink(dbfrom="pubmed", db="pmc", id=pmid)
@@ -88,12 +88,18 @@ def analyze_paper_bot(title, abstract, pmid):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0
         )
-        data = json.loads(re.search(r'\{.*\}', res.choices[0].message.content.strip(), re.DOTALL).group())
-        data['pmid'] = pmid
-        data['original_title'] = title
-        data['abstract'] = abstract
-        data['source'] = status
-        return data
+        # JSON 파싱 강화
+        raw_text = res.choices[0].message.content.strip()
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            data['pmid'] = pmid
+            data['original_title'] = title
+            data['abstract'] = abstract
+            data['source'] = status
+            return data
+        else:
+            return None
     except Exception as e:
         print(f"분석 에러: {e}")
         return None
@@ -106,26 +112,33 @@ def send_telegram(msg):
 if __name__ == "__main__":
     print("🤖 봇 기동...")
     
-    # 1. 설정 확인
-    if not get_config_status():
-        print("🔕 자동화 설정이 꺼져있어 종료합니다.")
-        exit(0)
-        
-    print("🟢 자동화 설정 ON - 작업 시작")
+    # [수정됨] 설정 체크 로직을 제거하고 무조건 실행
+    # if not get_config_status(): ... (삭제)
     
-    # 2. 논문 검색 (어제 날짜)
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y/%m/%d")
+    print("🟢 자동화 강제 실행 모드 (설정 체크 건너뜀)")
+    
+    # 2. 논문 검색 (최근 2일 - 주말 고려)
+    today = datetime.now()
+    yesterday = (today - timedelta(days=1)).strftime("%Y/%m/%d")
+    two_days_ago = (today - timedelta(days=2)).strftime("%Y/%m/%d")
+    
     term = '("TCM" OR "Acupuncture" OR "Herbal medicine") AND (hasabstract[text]) AND ("Humans"[Mesh])'
     
+    print(f"🔍 검색 기간: {two_days_ago} ~ {yesterday}")
+    
     try:
-        handle = Entrez.esearch(db="pubmed", term=term, mindate=yesterday, maxdate=yesterday, datetype="pdat", retmax=7)
+        handle = Entrez.esearch(db="pubmed", term=term, mindate=two_days_ago, maxdate=yesterday, datetype="pdat", retmax=7)
         pmids = Entrez.read(handle)["IdList"]
     except: pmids = []
     
     if not pmids:
-        send_telegram(f"📅 {yesterday}\n새로운 임상 논문이 없습니다.")
+        msg = f"📅 {yesterday}\n새로운 임상 논문이 없습니다."
+        print(msg)
+        send_telegram(msg)
         exit(0)
         
+    print(f"📄 검색된 논문 {len(pmids)}건 분석 시작...")
+
     # 3. 분석 및 DB 저장
     analyzed_list = []
     for pmid in pmids:
@@ -145,15 +158,16 @@ if __name__ == "__main__":
             
     # 4. 브리핑 생성 및 전송
     if analyzed_list:
-        # 점수순 정렬
-        analyzed_list.sort(key=lambda x: x['clinical_score'], reverse=True)
+        analyzed_list.sort(key=lambda x: x.get('clinical_score', 0), reverse=True)
         
         briefing = f"📅 **{yesterday} 한의 임상 브리핑**\n\n"
-        for i, paper in enumerate(analyzed_list[:5]): # Top 5만
+        for i, paper in enumerate(analyzed_list[:5]): # Top 5만 전송
             briefing += f"{'🥇' if i==0 else '🥈' if i==1 else '📰'} **{paper['korean_title']}**\n"
-            briefing += f"(⭐{paper['clinical_score']} / {paper['study_design']})\n"
-            briefing += f"{paper['summary']}\n"
+            briefing += f"(⭐{paper.get('clinical_score',0)} / {paper.get('study_design','')})\n"
+            briefing += f"{paper.get('summary','')}\n"
             briefing += f"🔗 https://pubmed.ncbi.nlm.nih.gov/{paper['pmid']}\n\n"
             
         send_telegram(briefing)
-        print("✅ 전송 및 저장 완료")
+        print("✅ 텔레그램 전송 및 DB 저장 완료")
+    else:
+        print("❌ 분석된 논문이 없어 전송하지 않았습니다.")
