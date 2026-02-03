@@ -18,12 +18,9 @@ st.set_page_config(page_title="한의학 논문 AI 큐레이터", layout="wide",
 DB_NAME = 'kmd_papers_v5_column.db'
 
 # 관리자 로그인 정보
-try:
-    ADMIN_ID = st.secrets["admin"]["id"]
-    ADMIN_PW = st.secrets["admin"]["pw"]
-except Exception as e:
-    # 로컬 테스트용 (secrets 파일이 없을 때 대비) 또는 에러 처리
-    #st.error("관리자 설정(Secrets)이 없습니다.")
+ADMIN_ID = st.secrets["admin"]["id"]
+ADMIN_PW = st.secrets["admin"]["pw"]
+
     
 # 스타일 커스텀
 st.markdown("""
