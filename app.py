@@ -311,6 +311,8 @@ def generate_daily_briefing_pro_v3(date_str, papers_df, api_key, model_choice):
     1. **톤앤매너:** 전문적이지만 딱딱하지 않게. "합니다/했습니다" 보다는 **"~임/함/확인됨"** 등의 개조식 혹은 **"~하는 것이 좋겠습니다"** 식의 제안형 어조 혼용.
     2. **핵심 강조:** 중요한 수치(N수, P값, 효과 크기)나 결론은 **굵은 글씨**로 강조.
     3. **비판적 시각:** 연구 디자인(RCT, SR 등)과 임상 점수(score)를 참고하여, 신뢰도가 낮은 논문은 "추가 검증이 필요함"이라고 언급.
+    4. Huzhang과 같이 한국어로 뭔지 모르는것은 반드시 찾아서 주석을 달아줄것. 찾지못하였다면 오늘의 논문으로 싣는 것을 포기할 것
+    5. EA, MA와 같은 줄임말을 사용한것은 EA(electroacupuncture)등과 같이 반드시 full name을 적어줄것. 찾지못하였다면 오늘의 논문으로 싣는 것을 포기할 것
 
     [출력 포맷 (Markdown)]
     
@@ -628,6 +630,7 @@ if __name__ == "__main__":
         db.pull_db()
         st.session_state.db_synced = True
     migrate_db()
+
 
 
 
