@@ -332,14 +332,26 @@ with tab_briefing:
                 st.success("완료!")
                 st.rerun()
     with c2:
-        st.subheader("📨 전송")
+        st.subheader("📨 공유 및 전송")
         content = get_daily_column(target_date_str)
         if content:
-            st.markdown(content)
-            if st.button("텔레그램 전송", type="primary"):
-                requests.post(f"https://api.telegram.org/bot{telegram_token}/sendMessage", json={"chat_id": chat_id, "text": content, "parse_mode": "Markdown"})
-                st.success("전송됨")
+            st.markdown("##### 🚀 텔레그램 전송")
+            user_footer = st.text_area("📢 추가 코멘트", height=70)
+            final_msg = content
+            if user_footer: final_msg += f"\n\n--------------------------------\n📢 **Editor's Note**\n{user_footer}"
 
+            if st.button("✈️ 텔레그램 전송", type="primary"):
+                if not telegram_token or not chat_id: st.error("토큰 필요")
+                else:
+                    try:
+                        url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+                        res = requests.post(url, json={"chat_id": chat_id, "text": final_msg, "parse_mode": "Markdown"})
+                        if res.status_code == 200: st.success("전송 완료")
+                        else: st.error(f"실패: {res.text}")
+                    except Exception as e: st.error(f"에러: {e}")
+            st.divider()
+            st.markdown(final_msg)
+        else: st.warning("브리핑 없음")
 # --- [Tab 2: 블로그 (참고문헌 자동 추가 기능)] ---
 # --- [Tab 2: 블로그 (상위 개념 확장 검색 기능 탑재)] ---
 with tab_blog:
@@ -573,6 +585,7 @@ if __name__ == "__main__":
         db.pull_db()
         st.session_state.db_synced = True
     migrate_db()
+
 
 
 
